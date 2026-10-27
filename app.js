@@ -39,6 +39,7 @@ let me = null;                 // perfil del usuario conectado {id, user, name, 
 let users = [], products = [], current = null; // current = id del turno abierto
 let session = null, sales = [], expenses = [], tabs = [];
 let pendingTab = null; // cuenta recién creada que aún no llega del servidor
+let receivables = []; // cuentas por cobrar de cierres anteriores
 let tabLines = {}, lineUnsubs = {}; // líneas (productos anotados) de cada cuenta abierta
 let tab = "caja", cat = "Todas", cart = [], selTab = null; // selTab = cuenta (mesa/cliente) seleccionada; null = venta rápida
 let unsubs = [], sessUnsubs = [];
@@ -147,6 +148,10 @@ function startListeners() {
     softRender();
   }, e => fail(e, "No se pudieron leer los productos.")));
   if (isAdmin()) unsubs.push(onSnapshot(collection(db, "users"), s => { users = s.docs.map(d => ({ id: d.id, ...d.data() })); softRender(); }));
+  unsubs.push(onSnapshot(query(collection(db, "receivables"), where("status", "==", "pending")), s => {
+    receivables = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+    renderNav(); if (tab === "cobrar") softRender();
+  }, e => console.error(e)));
   unsubs.push(onSnapshot(doc(db, "meta", "state"), { includeMetadataChanges: true }, s => {
     $("#sync").textContent = s.metadata.fromCache ? "Sin conexión" : "En línea";
     $("#sync").classList.toggle("off", s.metadata.fromCache);
@@ -190,7 +195,7 @@ function totals() {
 
 /* ---------- navegación ---------- */
 function renderNav() {
-  const items = [["caja", "Caja"], ["cuentas", "Cuentas" + (tabs.length ? " (" + tabs.length + ")" : "")], ["mov", "Movimientos"]];
+  const items = [["caja", "Caja"], ["cuentas", "Cuentas" + (tabs.length ? " (" + tabs.length + ")" : "")], ["cobrar", "Por cobrar" + (receivables.length ? " (" + receivables.length + ")" : "")], ["mov", "Movimientos"]];
   if (isAdmin()) items.push(["prod", "Productos"], ["users", "Usuarios"], ["hist", "Cierres"]);
   items.push(["cuenta", "Mi cuenta"]);
   $("#nav").innerHTML = items.map(([k, l]) => `<button class="${tab === k ? "on" : ""}" data-tab="${k}">${l}</button>`).join("");
@@ -198,7 +203,7 @@ function renderNav() {
 function render() {
   renderNav();
   const v = $("#view");
-  ({ caja: viewCaja, cuentas: viewCuentas, mov: viewMov, prod: viewProd, users: viewUsers, hist: viewHist, cuenta: viewCuenta }[tab] || viewCaja)(v);
+  ({ caja: viewCaja, cuentas: viewCuentas, cobrar: viewCobrar, mov: viewMov, prod: viewProd, users: viewUsers, hist: viewHist, cuenta: viewCuenta }[tab] || viewCaja)(v);
 }
 
 /* ---------- CAJA ---------- */
@@ -526,12 +531,14 @@ function bindPicker(root, id, onFile) {
   for (const s of ["Cam", "Gal"]) root.querySelector("#" + id + s).addEventListener("change", e => { const f = e.target.files[0]; e.target.value = ""; if (f) onFile(f); });
 }
 
-function payModal(t) {
+function payModal(t, rec) {
   if (t && draftOf(t.id).length) { toast("Primero agrega o descarta el pedido nuevo de " + t.label); return; }
-  const lines = t ? aggregate(tabLinesOf(t)) : cart.map(l => ({ ...l }));
+  if (rec && !current) { toast("Abre la caja para cobrar cuentas pendientes"); return; }
+  const lines = rec ? rec.items.map(l => ({ ...l })) : t ? aggregate(tabLinesOf(t)) : cart.map(l => ({ ...l }));
   const total = lines.reduce((a, l) => a + l.price * l.qty, 0);
   let m = "efectivo", img = null;
-  modal(`<h3>${t ? "Cobrar " + esc(t.label) : "Cobrar venta"}</h3>
+  modal(`<h3>${rec ? "Cobrar " + esc(rec.label) + " (por cobrar)" : t ? "Cobrar " + esc(t.label) : "Cobrar venta"}</h3>
+  ${rec ? `<div class="muted small">Cuenta del turno del ${dt(rec.sessionOpenedAt)}. El pago entra en la caja de hoy.</div>` : ""}
   <div class="sum num">${lines.map(l => `<div><span>${l.qty}× ${esc(l.name)}</span><span>${fmt(l.price * l.qty)}</span></div>`).join("")}</div>
   <div class="total"><span class="label">Total a pagar</span><span class="v num gold-text">${fmt(total)}</span></div>
   <div class="seg" id="pm">${Object.entries(METHODS).map(([k, l]) => `<button class="${k === m ? "on" : ""}" data-m="${k}">${l}</button>`).join("")}</div>
@@ -578,7 +585,16 @@ function payModal(t) {
           const saleRef = doc(collection(db, "sessions", sid, "sales"));
           const rcptRef = m === "transfer" && img ? doc(collection(db, "receipts")) : null;
           const base = { at: nowIso(), by: me.id, byName: me.name, method: m, voided: false, receiptId: rcptRef ? rcptRef.id : null, reference };
-          if (t) {
+          if (rec) {
+            await runTransaction(db, async tx => {
+              const rref = doc(db, "receivables", rec.id);
+              const s = await tx.get(rref);
+              if (!s.exists() || s.data().status !== "pending") throw { code: "tab-closed" };
+              if (rcptRef) tx.set(rcptRef, { img, at: nowIso(), by: me.id, session: sid, total });
+              tx.set(saleRef, { ...base, items: rec.items, total, account: rec.label + " (por cobrar)", receivableId: rec.id, fromSession: rec.sessionId, tabOpenedAt: rec.openedAt, lines: rec.lines || [] });
+              tx.update(rref, { status: "paid", paidAt: nowIso(), paidBy: me.id, paidByName: me.name, paidSession: sid, saleId: saleRef.id, method: m });
+            });
+          } else if (t) {
             const fresh = tabs.find(x => x.id === t.id);
             if (!fresh) throw { code: "tab-closed" };
             const allLines = tabLinesOf(fresh), items = aggregate(allLines);
@@ -639,6 +655,44 @@ function saleDetailModal(x) {
   <div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; });
 }
 
+/* ---------- cuentas por cobrar de cierres anteriores ---------- */
+function viewCobrar(v) {
+  const sum = receivables.reduce((a, r) => a + r.total, 0);
+  v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${receivables.length} cuenta${receivables.length === 1 ? "" : "s"} · ${fmt(sum)} por cobrar</div><h2>Cuentas por cobrar</h2></div></div>
+  <p class="muted" style="margin:0;max-width:65ch">Cuentas que quedaron abiertas al cerrar la caja. Al cobrarlas, el pago entra en la caja del turno abierto${current ? "" : " (abre la caja para poder cobrar)"}.</p>
+  ${receivables.length ? `<div class="cards">${receivables.map(r => `<div class="panel card">
+    <button class="card-hit" data-rdet="${r.id}" aria-label="Ver desglose de ${esc(r.label)}">
+      <div class="ct"><h3>${esc(r.label)}</h3><span class="pill warn">Pendiente</span></div>
+      <div class="muted small">Turno del ${dt(r.sessionOpenedAt)} · cerrado ${dt(r.closedAt)}</div>
+      ${r.note ? `<div class="muted small">${esc(r.note)}</div>` : ""}
+      <div class="items">${r.items.map(l => `${l.qty}× ${esc(l.name)}`).join(", ")}</div>
+      <div class="amt num">${fmt(r.total)}</div>
+      <div class="muted small">Toca para ver el desglose</div>
+    </button>
+    <div class="row"><button class="btn btn-gold btn-sm" data-rpay="${r.id}" ${current ? "" : "disabled"}>Cobrar</button>${isAdmin() ? `<button class="btn btn-danger btn-sm" data-rvoid="${r.id}">Anular deuda</button>` : ""}</div>
+  </div>`).join("")}</div>` : `<div class="panel pad empty">No hay cuentas pendientes de cierres anteriores.</div>`}</div>`;
+  v.querySelectorAll("[data-rdet]").forEach(b => b.onclick = () => recDetailModal(receivables.find(r => r.id === b.dataset.rdet)));
+  v.querySelectorAll("[data-rpay]").forEach(b => b.onclick = () => payModal(null, receivables.find(r => r.id === b.dataset.rpay)));
+  v.querySelectorAll("[data-rvoid]").forEach(b => b.onclick = () => {
+    const r = receivables.find(x => x.id === b.dataset.rvoid);
+    confirmBox("Anular deuda", `La cuenta ${esc(r.label)} por ${fmt(r.total)} dejará de aparecer en Por cobrar y no se cobrará. Úsalo solo si la deuda no se va a pagar.`, "Anular deuda", true,
+      () => updateDoc(doc(db, "receivables", r.id), { status: "void", voidedAt: nowIso(), voidedBy: me.name }).then(() => toast("Deuda anulada"), e => fail(e)));
+  });
+}
+function recDetailModal(r) {
+  const fake = { id: "_r", items: [], openedAt: r.openedAt };
+  tabLines._r = (r.lines || []).map((l, i) => ({ id: "l" + i, ...l }));
+  const orders = ordersOf(fake).filter(o => !o.onlyRemovals);
+  delete tabLines._r;
+  modal(`<div class="label">Por cobrar · turno del ${dt(r.sessionOpenedAt)}</div><h3 style="font-size:1.3rem">${esc(r.label)}</h3>${r.note ? `<div class="muted small">${esc(r.note)}</div>` : ""}
+  ${orders.map((o, i) => { const x = orderRows(o); return `<div class="ord big"><div class="ord-h"><span><b>Pedido ${i + 1}</b> · <span class="num">${dt(o.at)}</span> <span class="muted small">· ${esc(o.byName || "")}</span></span><span class="num"><b>${fmt(x.total)}</b></span></div>
+    <div class="ord-i">${x.agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ")}${x.rem.length ? ` <span class="muted">(${x.rem.length} retirado${x.rem.length > 1 ? "s" : ""})</span>` : ""}</div></div>`; }).join("")}
+  <div class="total"><span class="label">Total por cobrar</span><span class="v num gold-text">${fmt(r.total)}</span></div>
+  <div class="modal-f"><button class="btn btn-ghost" data-x>Cerrar</button><button class="btn btn-gold" data-p ${current ? "" : "disabled"}>Cobrar ${fmt(r.total)}</button></div>`, (m, c) => {
+    m.querySelector("[data-x]").onclick = c; m.querySelector("[data-p]").onclick = () => { c(); payModal(null, r); };
+  });
+}
+
 /* ---------- vista de cuentas abiertas ---------- */
 function viewCuentas(v) {
   if (!current || !session) { v.innerHTML = `<div class="panel pad empty">La caja está cerrada. Abre la caja para llevar cuentas por mesa o cliente.</div>`; return; }
@@ -684,15 +738,17 @@ function productSummary() {
   return Object.values(map).sort((a, b) => b.v - a.v);
 }
 function closeModal() {
-  if (tabs.length) {
-    modal(`<h3>Hay cuentas sin cobrar</h3><p class="muted" style="margin:0">Antes de cerrar la caja hay que cobrar estas cuentas:</p>
-    <div class="sum num">${tabs.map(x => `<div><span>${esc(x.label)}</span><span>${fmt(tabTotal(x))}</span></div>`).join("")}</div>
-    <div class="modal-f"><button class="btn btn-ghost" data-x>Cancelar</button><button class="btn btn-gold" data-ok>Ver cuentas</button></div>`,
-    (m, close) => { m.querySelector("[data-x]").onclick = close; m.querySelector("[data-ok]").onclick = () => { close(); tab = "cuentas"; render(); }; });
-    return;
-  }
   const t = totals();
+  const open = tabs.map(x => ({ t: x, total: tabTotal(x) }));
+  const withDebt = open.filter(o => o.total > 0), pendTotal = withDebt.reduce((a, o) => a + o.total, 0);
+  const unsent = tabs.filter(x => draftOf(x.id).length);
   modal(`<h3>Cierre de caja</h3>
+  ${open.length ? `<div class="warnbox"><b>Quedan ${open.length} cuenta${open.length > 1 ? "s" : ""} sin cobrar${pendTotal ? " por " + fmt(pendTotal) : ""}.</b>
+    ${withDebt.length ? `<div class="small">Al cerrar pasarán a <b>Por cobrar</b> y se podrán cobrar en otro turno. No cuentan como venta de hoy.</div>
+    <div class="sum num">${withDebt.map(o => `<div><span>${esc(o.t.label)}</span><span>${fmt(o.total)}</span></div>`).join("")}</div>` : ""}
+    ${open.length > withDebt.length ? `<div class="small muted">Las cuentas sin consumo se cierran sin deuda.</div>` : ""}
+    ${unsent.length ? `<div class="small" style="color:var(--bad)">Pedidos armados sin agregar en ${unsent.map(x => esc(x.label)).join(", ")} se descartarán.</div>` : ""}
+  </div>` : ""}
   <div class="sum num">
     <div><span>Base inicial</span><span>${fmt(session.base)}</span></div>
     <div><span>Ventas en efectivo</span><span>+ ${fmt(t.by.efectivo)}</span></div>
@@ -719,11 +775,24 @@ function closeModal() {
       if (c.value.trim() === "") { m.querySelector("#cerr").textContent = "Cuenta el efectivo y escribe el valor (puede ser $ 0)."; return; }
       busy(e.currentTarget, async () => {
         const t2 = totals(); const n = parseMoney(c.value);
+        const pend = tabs.map(x => ({ x, lines: tabLinesOf(x), items: aggregate(tabLinesOf(x)) })).map(o => ({ ...o, total: sumLines(o.items) }));
+        const debts = pend.filter(o => o.total > 0);
         const data = { closedAt: nowIso(), closedBy: me.id, closedByName: me.name, counted: n, expected: t2.expected, diff: n - t2.expected,
-          closeNote: m.querySelector("#cnote").value.trim(), summary: { ...t2, products: productSummary() } };
+          closeNote: m.querySelector("#cnote").value.trim(),
+          summary: { ...t2, products: productSummary(), pendingCount: debts.length, pendingTotal: debts.reduce((a, o) => a + o.total, 0), pendingList: debts.map(o => ({ label: o.x.label, total: o.total })) } };
         const report = { ...session, ...data };
         try {
           const b = writeBatch(db);
+          for (const o of pend) {
+            const tref = doc(db, "sessions", session.id, "tabs", o.x.id);
+            if (o.total > 0) {
+              b.set(doc(db, "receivables", o.x.id), { label: o.x.label, kind: o.x.kind || "", note: o.x.note || "", openedAt: o.x.openedAt, openedByName: o.x.openedByName || "",
+                sessionId: session.id, sessionOpenedAt: session.openedAt, closedAt: data.closedAt, closedByName: me.name,
+                items: o.items, total: o.total, lines: o.lines.map(l => ({ name: l.name, qty: l.qty, price: l.price, at: l.at, byName: l.byName || "", orderId: l.orderId || null })), status: "pending" });
+              b.update(tref, { status: "pending", movedAt: data.closedAt, total: o.total });
+            } else b.update(tref, { status: "empty", movedAt: data.closedAt });
+          }
+          for (const k of Object.keys(drafts)) delete drafts[k];
           b.update(doc(db, "sessions", session.id), data);
           b.set(doc(db, "meta", "state"), { current: null });
           await b.commit();
@@ -748,13 +817,15 @@ function reportHTML(s) {
     <div><span>Efectivo esperado</span><span>${fmt(s.expected)}</span></div>
     <div><span>Efectivo contado</span><span>${fmt(s.counted)}</span></div>
     <div><span>Resultado</span><span>${diffPill(s.diff)}</span></div>
+    ${t.pendingCount ? `<div><span>Quedaron por cobrar (${t.pendingCount})</span><span>${fmt(t.pendingTotal)}</span></div>` : ""}
   </div>
+  ${(t.pendingList || []).length ? `<div class="label" style="margin-top:14px">Cuentas por cobrar</div><div class="sum num">${t.pendingList.map(p => `<div><span>${esc(p.label)}</span><span>${fmt(p.total)}</span></div>`).join("")}</div>` : ""}
   ${rows.length ? `<div class="label" style="margin-top:14px">Productos vendidos</div><div class="tbl-wrap"><table><thead><tr><th>Producto</th><th class="r">Cant.</th><th class="r">Valor</th></tr></thead><tbody>${rows.map(x => `<tr><td>${esc(x.name)}</td><td class="r num">${x.q}</td><td class="r num">${fmt(x.v)}</td></tr>`).join("")}</tbody></table></div>` : ""}
   ${s.closeNote ? `<p class="muted">Obs.: ${esc(s.closeNote)}</p>` : ""}</div>`;
 }
 function reportText(s) {
   const t = s.summary;
-  return `SANTORINI CLUB - CIERRE DE CAJA\n${dt(s.openedAt)} a ${dt(s.closedAt)}\nAbrió: ${s.openedByName} | Cerró: ${s.closedByName}\nBase: ${fmt(s.base)}\nEfectivo: ${fmt(t.by.efectivo)}\nTransferencias: ${fmt(t.by.transfer)}\nSalidas: ${fmt(t.exp)}\nTOTAL VENDIDO: ${fmt(t.sales)}\nEsperado en caja: ${fmt(s.expected)}\nContado: ${fmt(s.counted)}\nDiferencia: ${s.diff >= 0 ? "+" : "-"}${fmt(Math.abs(s.diff))}${s.closeNote ? "\nObs: " + s.closeNote : ""}`;
+  return `SANTORINI CLUB - CIERRE DE CAJA\n${dt(s.openedAt)} a ${dt(s.closedAt)}\nAbrió: ${s.openedByName} | Cerró: ${s.closedByName}\nBase: ${fmt(s.base)}\nEfectivo: ${fmt(t.by.efectivo)}\nTransferencias: ${fmt(t.by.transfer)}\nSalidas: ${fmt(t.exp)}\nTOTAL VENDIDO: ${fmt(t.sales)}\nEsperado en caja: ${fmt(s.expected)}\nContado: ${fmt(s.counted)}\nDiferencia: ${s.diff >= 0 ? "+" : "-"}${fmt(Math.abs(s.diff))}${t.pendingCount ? "\nQuedaron por cobrar: " + t.pendingCount + " cuentas, " + fmt(t.pendingTotal) + "\n" + t.pendingList.map(p => "- " + p.label + ": " + fmt(p.total)).join("\n") : ""}${s.closeNote ? "\nObs: " + s.closeNote : ""}`;
 }
 function reportModal(s) {
   modal(reportHTML(s) + `<div class="modal-f"><button class="btn" data-copy>Copiar resumen</button><button class="btn btn-gold" data-x>Listo</button></div>`, (m, close) => {

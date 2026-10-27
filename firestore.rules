@@ -64,6 +64,13 @@ service cloud.firestore {
       }
     }
 
+    // Cuentas que quedaron sin cobrar al cerrar la caja.
+    match /receivables/{id} {
+      allow read, create: if isActive();
+      allow update: if isActive() && (request.resource.data.status == 'paid' || isAdmin());
+      allow delete: if false;
+    }
+
     // Captures de transferencias (imagen reducida, guardada como texto).
     match /receipts/{id} {
       allow read: if isActive();
