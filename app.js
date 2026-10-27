@@ -196,14 +196,14 @@ function totals() {
 /* ---------- navegación ---------- */
 function renderNav() {
   const items = [["caja", "Caja"], ["cuentas", "Cuentas" + (tabs.length ? " (" + tabs.length + ")" : "")], ["cobrar", "Por cobrar" + (receivables.length ? " (" + receivables.length + ")" : "")], ["mov", "Movimientos"]];
-  if (isAdmin()) items.push(["prod", "Productos"], ["users", "Usuarios"], ["hist", "Cierres"]);
+  if (isAdmin()) items.push(["rep", "Reportes"], ["prod", "Productos"], ["users", "Usuarios"], ["hist", "Cierres"]);
   items.push(["cuenta", "Mi cuenta"]);
   $("#nav").innerHTML = items.map(([k, l]) => `<button class="${tab === k ? "on" : ""}" data-tab="${k}">${l}</button>`).join("");
 }
 function render() {
   renderNav();
   const v = $("#view");
-  ({ caja: viewCaja, cuentas: viewCuentas, cobrar: viewCobrar, mov: viewMov, prod: viewProd, users: viewUsers, hist: viewHist, cuenta: viewCuenta }[tab] || viewCaja)(v);
+  ({ caja: viewCaja, cuentas: viewCuentas, cobrar: viewCobrar, mov: viewMov, rep: viewReport, prod: viewProd, users: viewUsers, hist: viewHist, cuenta: viewCuenta }[tab] || viewCaja)(v);
 }
 
 /* ---------- CAJA ---------- */
@@ -1009,6 +1009,164 @@ async function viewHist(v) {
   </tbody></table></div></div></div>`;
   v.querySelectorAll("[data-rep]").forEach(b => b.onclick = () => reportModal(closed.find(s => s.id === b.dataset.rep)));
   $("#bkBtn").onclick = backupModal;
+}
+
+/* ---------- REPORTE DE VENTAS ----------
+   Las ventas se agrupan por "noche": lo vendido entre las 6 a. m. de un día y las 6 a. m. del siguiente
+   cuenta para la noche del primer día (una venta a las 2 a. m. del sábado es de la noche del viernes). */
+const NIGHT_SHIFT_H = 6;
+const nightKey = iso => { const d = new Date(new Date(iso).getTime() - NIGHT_SHIFT_H * 36e5); const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+const nightLabel = k => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString("es-CO", { weekday: "short", day: "2-digit", month: "short" }); };
+const todayNight = () => nightKey(nowIso());
+const addDays = (k, n) => { const [y, m, d] = k.split("-").map(Number); const x = new Date(y, m - 1, d + n); const p = v => String(v).padStart(2, "0"); return `${x.getFullYear()}-${p(x.getMonth() + 1)}-${p(x.getDate())}`; };
+let rep = { range: "7", from: "", to: "", loading: false, data: null };
+
+function repBounds() {
+  const today = todayNight();
+  switch (rep.range) {
+    case "turno": return { turno: true };
+    case "hoy": return { from: today, to: today };
+    case "ayer": return { from: addDays(today, -1), to: addDays(today, -1) };
+    case "7": return { from: addDays(today, -6), to: today };
+    case "30": return { from: addDays(today, -29), to: today };
+    case "mes": return { from: today.slice(0, 8) + "01", to: today };
+    case "custom": return { from: rep.from || today, to: rep.to || today };
+  }
+  return { from: today, to: today };
+}
+
+async function loadReportSales(b) {
+  if (b.turno) return current ? sales.map(x => ({ ...x, _sid: current })) : [];
+  // Turnos que pueden tener ventas en el periodo (con un día de margen).
+  const lo = addDays(b.from, -1) + "T00:00", hi = addDays(b.to, 2) + "T00:00";
+  const sess = (await getDocs(collection(db, "sessions"))).docs.map(d => ({ id: d.id, ...d.data() }))
+    .filter(s => s.openedAt < hi && (!s.closedAt || s.closedAt >= lo));
+  const out = [];
+  for (const s of sess) {
+    let list;
+    if (s.id === current) list = sales;
+    else if (saleCache[s.id]) list = saleCache[s.id];
+    else { list = (await getDocs(query(collection(db, "sessions", s.id, "sales"), orderBy("at")))).docs.map(d => ({ id: d.id, ...d.data() })); if (s.closedAt) saleCache[s.id] = list; }
+    for (const x of list) { const k = nightKey(x.at); if (k >= b.from && k <= b.to) out.push({ ...x, _sid: s.id }); }
+  }
+  return out.sort((a, c) => a.at.localeCompare(c.at));
+}
+
+function computeReport(list, b) {
+  const valid = list.filter(x => !x.voided), voided = list.filter(x => x.voided);
+  const total = valid.reduce((a, x) => a + x.total, 0);
+  const byMethod = { efectivo: 0, transfer: 0 }; valid.forEach(x => byMethod[x.method] = (byMethod[x.method] || 0) + x.total);
+  const catOf = pid => (products.find(p => p.id === pid) || {}).category || "Otros";
+  const prod = new Map(), cat = new Map(), cashier = new Map(), night = new Map(), hour = new Map(), kind = { quick: [0, 0], tab: [0, 0], rec: [0, 0] };
+  for (const x of valid) {
+    const k = nightKey(x.at); night.set(k, (night.get(k) || 0) + x.total);
+    const h = new Date(x.at).getHours(); hour.set(h, (hour.get(h) || 0) + x.total);
+    const c = cashier.get(x.byName || "—") || { n: 0, v: 0 }; c.n++; c.v += x.total; cashier.set(x.byName || "—", c);
+    const kk = x.receivableId ? "rec" : x.account ? "tab" : "quick"; kind[kk][0]++; kind[kk][1] += x.total;
+    for (const l of x.items || []) {
+      const key = l.pid || l.name;
+      const p = prod.get(key) || { name: l.name, q: 0, v: 0 }; p.q += l.qty; p.v += l.qty * l.price; prod.set(key, p);
+      const cn = catOf(l.pid); cat.set(cn, (cat.get(cn) || 0) + l.qty * l.price);
+    }
+  }
+  // Noches del periodo, incluidas las que no tuvieron ventas.
+  const nights = [];
+  if (!b.turno) for (let k = b.from; k <= b.to; k = addDays(k, 1)) nights.push([k, night.get(k) || 0]);
+  else for (const [k, v] of [...night].sort()) nights.push([k, v]);
+  const hourOrder = [...Array(24).keys()].map(i => (i + 12) % 24); // 12 m. → 11 a. m.
+  const hours = hourOrder.map(h => [h, hour.get(h) || 0]);
+  const firstH = hours.findIndex(x => x[1] > 0), lastH = hours.length - 1 - [...hours].reverse().findIndex(x => x[1] > 0);
+  return {
+    list, valid, voided, total, count: valid.length, avg: valid.length ? total / valid.length : 0, byMethod, kind,
+    products: [...prod.values()].sort((a, c) => c.v - a.v),
+    cats: [...cat].sort((a, c) => c[1] - a[1]),
+    cashiers: [...cashier].sort((a, c) => c[1].v - a[1].v),
+    nights, hours: firstH < 0 ? [] : hours.slice(firstH, lastH + 1),
+    best: nights.length ? nights.reduce((m, x) => x[1] > m[1] ? x : m, nights[0]) : null
+  };
+}
+
+const hLabel = h => (h % 12 || 12) + (h < 12 ? " a. m." : " p. m.");
+function colChart(rows, labelFn) {
+  if (!rows.length) return `<div class="muted small">Sin datos.</div>`;
+  const max = Math.max(...rows.map(r => r[1]), 1);
+  return `<div class="cols" style="--n:${rows.length}">${rows.map(r => `<div class="col" title="${esc(labelFn(r[0]))}: ${fmt(r[1])}">
+    <span class="cv num">${r[1] ? fmtK(r[1]) : ""}</span><span class="cb" style="height:${Math.max(r[1] ? 3 : 0, r[1] / max * 100)}%"></span><span class="cl">${esc(labelFn(r[0]))}</span></div>`).join("")}</div>`;
+}
+const fmtK = n => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(".", ",") + " M" : n >= 1e3 ? Math.round(n / 1e3) + " mil" : String(n);
+function barList(rows, total) {
+  if (!rows.length) return `<div class="muted small">Sin datos.</div>`;
+  const max = Math.max(...rows.map(r => r.v), 1);
+  return `<div class="bars">${rows.map(r => `<div class="bar-row"><div class="bar-top"><span class="bar-name">${esc(r.name)}</span><span class="num">${r.sub ? `<span class="muted">${esc(r.sub)} · </span>` : ""}<b>${fmt(r.v)}</b>${total ? ` <span class="muted">${Math.round(r.v / total * 100)}%</span>` : ""}</span></div>
+    <div class="bar-track"><span style="width:${r.v / max * 100}%"></span></div></div>`).join("")}</div>`;
+}
+
+async function viewReport(v) {
+  if (!isAdmin()) return viewCaja(v);
+  const b = repBounds();
+  const opts = [["turno", "Turno actual"], ["hoy", "Esta noche"], ["ayer", "Anoche"], ["7", "Últimos 7 días"], ["30", "Últimos 30 días"], ["mes", "Este mes"], ["custom", "Elegir fechas"]];
+  const periodTxt = b.turno ? (current && session ? "Turno abierto desde " + dt(session.openedAt) : "No hay turno abierto") : b.from === b.to ? "Noche del " + nightLabel(b.from) : nightLabel(b.from) + " al " + nightLabel(b.to);
+  v.innerHTML = `<div class="sec rep">
+    <div class="sec-h"><div><div class="label">${esc(periodTxt)}</div><h2>Reporte de ventas</h2></div>
+      <div class="row" style="align-items:center"><button class="btn btn-sm" id="repXls">Descargar Excel</button></div></div>
+    <div class="chips" role="tablist">${opts.map(([k, l]) => `<button class="chip ${rep.range === k ? "on" : ""}" data-r="${k}">${l}</button>`).join("")}</div>
+    ${rep.range === "custom" ? `<div class="row"><div class="field" style="flex:0 1 200px"><label class="label" for="rf">Desde</label><input class="input" type="date" id="rf" value="${b.from}"></div>
+      <div class="field" style="flex:0 1 200px"><label class="label" for="rt">Hasta</label><input class="input" type="date" id="rt" value="${b.to}"></div><button class="btn" id="rgo">Ver</button></div>` : ""}
+    <div id="repBody"><div class="loading" style="min-height:30vh">Calculando…</div></div>
+    <p class="muted small" style="margin:0">Cada noche va de las 6 a. m. a las 6 a. m. del día siguiente: lo vendido a las 2 a. m. cuenta para la noche anterior. No incluye ventas anuladas ni cuentas por cobrar aún no pagadas.</p>
+  </div>`;
+  v.querySelectorAll("[data-r]").forEach(x => x.onclick = () => { rep.range = x.dataset.r; render(); });
+  $("#rgo")?.addEventListener("click", () => { rep.from = $("#rf").value; rep.to = $("#rt").value; if (rep.from > rep.to) [rep.from, rep.to] = [rep.to, rep.from]; render(); });
+  let list;
+  try { list = await loadReportSales(b); } catch (e) { console.error(e); const bd = $("#repBody"); if (bd) bd.innerHTML = `<div class="panel pad err">No se pudieron leer las ventas. Revisa la conexión.</div>`; return; }
+  if (tab !== "rep" || !$("#repBody")) return;
+  const r = computeReport(list, b);
+  const pend = receivables.reduce((a, x) => a + x.total, 0);
+  $("#repBody").innerHTML = `
+  <div class="kpis">
+    <div class="kpi main"><span class="label">Total vendido</span><span class="kv num">${fmt(r.total)}</span><span class="muted small">${r.count} venta${r.count === 1 ? "" : "s"}${r.voided.length ? ` · ${r.voided.length} anulada${r.voided.length > 1 ? "s" : ""}` : ""}</span></div>
+    <div class="kpi"><span class="label">Efectivo</span><span class="kv num">${fmt(r.byMethod.efectivo)}</span><span class="muted small">${r.total ? Math.round(r.byMethod.efectivo / r.total * 100) : 0}% del total</span></div>
+    <div class="kpi"><span class="label">Transferencias</span><span class="kv num">${fmt(r.byMethod.transfer)}</span><span class="muted small">${r.total ? Math.round(r.byMethod.transfer / r.total * 100) : 0}% del total</span></div>
+    <div class="kpi"><span class="label">Venta promedio</span><span class="kv num">${fmt(r.avg)}</span><span class="muted small">por cuenta o venta</span></div>
+    <div class="kpi"><span class="label">Por cobrar hoy</span><span class="kv num ${pend ? "warnc" : ""}">${fmt(pend)}</span><span class="muted small">${receivables.length} cuenta${receivables.length === 1 ? "" : "s"} pendiente${receivables.length === 1 ? "" : "s"}</span></div>
+  </div>
+  ${!r.count ? `<div class="panel pad empty">No hay ventas en este periodo.</div>` : `
+  <div class="rgrid">
+    ${r.nights.length > 1 ? `<div class="panel pad span2"><div class="ph"><h3>Ventas por noche</h3>${r.best && r.best[1] ? `<span class="muted small">Mejor noche: <b>${esc(nightLabel(r.best[0]))}</b> · ${fmt(r.best[1])}</span>` : ""}</div>${colChart(r.nights, k => nightLabel(k).replace(".", ""))}</div>` : ""}
+    <div class="panel pad ${r.nights.length > 1 ? "" : "span2"}"><div class="ph"><h3>Ventas por hora</h3><span class="muted small">Para ver a qué hora se vende más</span></div>${colChart(r.hours, hLabel)}</div>
+    <div class="panel pad"><div class="ph"><h3>Tipo de venta</h3></div>${barList([
+      { name: "Mesas y clientes", sub: r.kind.tab[0] + " cuentas", v: r.kind.tab[1] },
+      { name: "Ventas rápidas", sub: r.kind.quick[0] + " ventas", v: r.kind.quick[1] },
+      { name: "Cuentas por cobrar pagadas", sub: r.kind.rec[0] + " cuentas", v: r.kind.rec[1] }].filter(x => x.v), r.total)}</div>
+    <div class="panel pad"><div class="ph"><h3>Productos más vendidos</h3><span class="muted small">${r.products.length} productos</span></div>
+      ${barList(r.products.slice(0, 10).map(p => ({ name: p.name, sub: p.q + " und", v: p.v })), r.total)}</div>
+    <div class="panel pad"><div class="ph"><h3>Por categoría</h3></div>${barList(r.cats.map(([n, v]) => ({ name: n, v })), r.total)}</div>
+    <div class="panel pad"><div class="ph"><h3>Por cajero</h3></div>${barList(r.cashiers.map(([n, c]) => ({ name: n, sub: c.n + " ventas", v: c.v })), r.total)}</div>
+  </div>
+  <div class="panel"><div class="ph pad" style="padding-bottom:0"><h3>Todos los productos</h3></div><div class="tbl-wrap"><table><thead><tr><th>Producto</th><th class="r">Cantidad</th><th class="r">Valor</th><th class="r">% de ventas</th></tr></thead><tbody>
+    ${r.products.map(p => `<tr><td>${esc(p.name)}</td><td class="r num">${p.q}</td><td class="r num">${fmt(p.v)}</td><td class="r num">${(p.v / r.total * 100).toFixed(1).replace(".", ",")}%</td></tr>`).join("")}
+    <tr class="tot"><td><b>Total</b></td><td class="r num"><b>${r.products.reduce((a, p) => a + p.q, 0)}</b></td><td class="r num"><b>${fmt(r.total)}</b></td><td class="r num">100%</td></tr>
+  </tbody></table></div></div>
+  <div class="panel"><div class="ph pad" style="padding-bottom:0"><h3>Detalle de ventas</h3><span class="muted small">Toca una cuenta para ver su desglose</span></div><div class="tbl-wrap"><table><thead><tr><th>Fecha</th><th>Cuenta</th><th>Productos</th><th>Pago</th><th>Cobró</th><th class="r">Total</th></tr></thead><tbody>
+    ${[...r.list].reverse().map(x => `<tr class="${x.voided ? "voided" : ""}"><td class="num">${dt(x.at)}</td><td>${x.account ? `<button class="link" data-rs="${x._sid}|${x.id}">${esc(x.account)}</button>` : '<span class="muted">Venta rápida</span>'}${x.voided ? ' <span class="pill void">Anulada</span>' : ""}</td>
+      <td class="items">${(x.items || []).map(i => `${i.qty}× ${esc(i.name)}`).join(", ")}</td><td>${esc(METHODS[x.method] || x.method)}</td><td>${esc(x.byName || "")}</td><td class="r num">${fmt(x.total)}</td></tr>`).join("")}
+  </tbody></table></div></div>`}`;
+  $("#repBody").querySelectorAll("[data-rs]").forEach(x => x.onclick = () => { const [sid, id] = x.dataset.rs.split("|"); saleDetailModal(r.list.find(y => y._sid === sid && y.id === id)); });
+  $("#repXls").onclick = e => busy(e.currentTarget, async () => {
+    try {
+      const XLSX = await loadXLSX(); const wb = XLSX.utils.book_new();
+      const sheet = (rows, name) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "": "Sin datos" }]); ws["!cols"] = Object.keys(rows[0] || { "": 1 }).map(k => ({ wch: Math.max(12, Math.min(45, k.length + 4, ...rows.slice(0, 200).map(x => String(x[k] ?? "").length + 2))) })); XLSX.utils.book_append_sheet(wb, ws, name); };
+      sheet([{ "Periodo": periodTxt, "Total vendido": r.total, "Ventas": r.count, "Venta promedio": Math.round(r.avg), "Efectivo": r.byMethod.efectivo, "Transferencias": r.byMethod.transfer, "Anuladas": r.voided.length, "Por cobrar pendiente": pend }], "Resumen");
+      sheet(r.nights.map(([k, v]) => ({ "Noche": nightLabel(k), "Fecha": k, "Total": v })), "Por noche");
+      sheet(r.hours.map(([h, v]) => ({ "Hora": hLabel(h), "Total": v })), "Por hora");
+      sheet(r.products.map(p => ({ "Producto": p.name, "Cantidad": p.q, "Valor": p.v, "% de ventas": +(p.v / (r.total || 1) * 100).toFixed(1) })), "Productos");
+      sheet(r.cats.map(([n, v]) => ({ "Categoría": n, "Valor": v })), "Categorías");
+      sheet(r.cashiers.map(([n, c]) => ({ "Cajero": n, "Ventas": c.n, "Valor": c.v })), "Cajeros");
+      sheet(r.list.map(x => ({ "Fecha y hora": fdt(x.at), "Noche": nightKey(x.at), "Cuenta": x.account || "Venta rápida", "Productos": (x.items || []).map(i => `${i.qty}× ${i.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Cobró": x.byName || "", "Total": x.total, "Anulada": x.voided ? "Sí" : "No" })), "Ventas");
+      const name = `Santorini-reporte-${b.turno ? "turno" : b.from + (b.to !== b.from ? "_a_" + b.to : "")}.xlsx`;
+      XLSX.writeFile(wb, name); toast("Reporte descargado");
+    } catch (ex) { console.error(ex); toast("No se pudo generar el Excel. Revisa la conexión."); }
+  });
 }
 
 /* ---------- RESPALDO EN EXCEL ---------- */

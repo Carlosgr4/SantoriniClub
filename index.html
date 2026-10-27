@@ -243,6 +243,29 @@ td.num,td.r{white-space:nowrap}
 .warnbox{border:1px solid rgba(226,166,74,.45);background:rgba(226,166,74,.08);border-radius:8px;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
 .paidlist{display:flex;flex-direction:column;gap:8px;margin-top:6px}
 .paidlist table{font-size:.88rem}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+@media (max-width:520px){.kpi.main{grid-column:1/-1}.kv{font-size:1.15rem}}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.kpi.main{border-color:var(--gold-lo);background:linear-gradient(180deg,rgba(217,172,79,.10),var(--surface))}
+.kv{font-size:1.45rem;font-weight:700}
+.kpi.main .kv{font-family:var(--display);font-size:1.8rem;color:var(--gold-hi)}
+.warnc{color:var(--warn)}
+.rep #repBody{display:flex;flex-direction:column;gap:16px}
+.rgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.rgrid .span2{grid-column:1/-1}
+@media (max-width:860px){.rgrid{grid-template-columns:minmax(0,1fr)}}
+.ph{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.cols{display:grid;grid-template-columns:repeat(var(--n),minmax(18px,1fr));gap:6px;align-items:end;height:200px;overflow-x:auto;padding-top:4px}
+.col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0;gap:4px}
+.cb{width:100%;max-width:46px;background:linear-gradient(180deg,var(--gold-hi),var(--gold-lo));border-radius:4px 4px 0 0;display:block}
+.cv{font-size:.66rem;color:var(--muted);white-space:nowrap}
+.cl{font-size:.66rem;color:var(--muted);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.bars{display:flex;flex-direction:column;gap:10px}
+.bar-top{display:flex;justify-content:space-between;gap:10px;font-size:.88rem}
+.bar-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-track{height:8px;background:var(--surface-2);border-radius:99px;overflow:hidden;margin-top:4px}
+.bar-track span{display:block;height:100%;background:linear-gradient(90deg,var(--gold-lo),var(--gold-hi));border-radius:99px}
+tr.tot td{border-top:1px solid var(--line-2)}
 </style>
 </head>
 <body>
