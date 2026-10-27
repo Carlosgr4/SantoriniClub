@@ -833,8 +833,9 @@ function reportText(s) {
 const saleCache = {}; // ventas de cada turno ya consultadas
 function reportModal(s) {
   modal(reportHTML(s) + `<div class="paidlist" data-paid><div class="label">Cuentas cobradas en este turno</div><div class="muted small">Cargando…</div></div>
-  <div class="modal-f"><button class="btn" data-copy>Copiar resumen</button><button class="btn btn-gold" data-x>Listo</button></div>`, async (m, close) => {
+  <div class="modal-f">${s.closedAt && isAdmin() ? `<button class="btn" data-xl>Descargar Excel</button>` : ""}<button class="btn" data-copy>Copiar resumen</button><button class="btn btn-gold" data-x>Listo</button></div>`, async (m, close) => {
     m.querySelector("[data-x]").onclick = close;
+    m.querySelector("[data-xl]")?.addEventListener("click", e => downloadOneClosing(s, e.currentTarget));
     m.querySelector("[data-copy]").onclick = () => { navigator.clipboard.writeText(reportText(s)).then(() => toast("Resumen copiado, pégalo en WhatsApp"), () => toast("No se pudo copiar")); };
     const box = m.querySelector("[data-paid]");
     let list = saleCache[s.id];
@@ -1002,7 +1003,7 @@ async function viewHist(v) {
   } catch (e) { fail(e, "No se pudieron leer los cierres."); }
   if (tab !== "hist") return;
   const sum = closed.reduce((a, s) => a + (s.summary?.sales || 0), 0);
-  v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${closed.length} turnos cerrados · ${fmt(sum)} vendidos</div><h2>Cierres de caja</h2></div><button class="btn btn-gold" id="bkBtn">Descargar respaldo</button></div>
+  v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${closed.length} turnos cerrados · ${fmt(sum)} vendidos</div><h2>Cierres de caja</h2></div><button class="btn btn-gold" id="bkBtn">Descargar Excel</button></div>
   <div class="panel"><div class="tbl-wrap"><table><thead><tr><th>Apertura</th><th>Cierre</th><th>Cajero</th><th class="r">Vendido</th><th class="r">Efectivo esperado</th><th class="r">Contado</th><th>Resultado</th><th></th></tr></thead><tbody>
   ${closed.map(s => `<tr><td class="num">${dt(s.openedAt)}</td><td class="num">${dt(s.closedAt)}</td><td>${esc(s.openedByName)}${s.closedByName !== s.openedByName ? " / " + esc(s.closedByName) : ""}</td>
   <td class="r num"><b>${fmt(s.summary.sales)}</b></td><td class="r num">${fmt(s.expected)}</td><td class="r num">${fmt(s.counted)}</td><td>${diffPill(s.diff)}</td><td><button class="btn btn-sm" data-rep="${s.id}">Ver</button></td></tr>`).join("") || `<tr><td colspan="8" class="empty">Todavía no hay cierres. Aparecerán aquí cada vez que se cierre la caja.</td></tr>`}
@@ -1154,37 +1155,174 @@ async function viewReport(v) {
   $("#repBody").querySelectorAll("[data-rs]").forEach(x => x.onclick = () => { const [sid, id] = x.dataset.rs.split("|"); saleDetailModal(r.list.find(y => y._sid === sid && y.id === id)); });
   $("#repXls").onclick = e => busy(e.currentTarget, async () => {
     try {
-      const XLSX = await loadXLSX(); const wb = XLSX.utils.book_new();
-      const sheet = (rows, name) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "": "Sin datos" }]); ws["!cols"] = Object.keys(rows[0] || { "": 1 }).map(k => ({ wch: Math.max(12, Math.min(45, k.length + 4, ...rows.slice(0, 200).map(x => String(x[k] ?? "").length + 2))) })); XLSX.utils.book_append_sheet(wb, ws, name); };
-      sheet([{ "Periodo": periodTxt, "Total vendido": r.total, "Ventas": r.count, "Venta promedio": Math.round(r.avg), "Efectivo": r.byMethod.efectivo, "Transferencias": r.byMethod.transfer, "Anuladas": r.voided.length, "Por cobrar pendiente": pend }], "Resumen");
-      sheet(r.nights.map(([k, v]) => ({ "Noche": nightLabel(k), "Fecha": k, "Total": v })), "Por noche");
-      sheet(r.hours.map(([h, v]) => ({ "Hora": hLabel(h), "Total": v })), "Por hora");
-      sheet(r.products.map(p => ({ "Producto": p.name, "Cantidad": p.q, "Valor": p.v, "% de ventas": +(p.v / (r.total || 1) * 100).toFixed(1) })), "Productos");
-      sheet(r.cats.map(([n, v]) => ({ "Categoría": n, "Valor": v })), "Categorías");
-      sheet(r.cashiers.map(([n, c]) => ({ "Cajero": n, "Ventas": c.n, "Valor": c.v })), "Cajeros");
-      sheet(r.list.map(x => ({ "Fecha y hora": fdt(x.at), "Noche": nightKey(x.at), "Cuenta": x.account || "Venta rápida", "Productos": (x.items || []).map(i => `${i.qty}× ${i.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Cobró": x.byName || "", "Total": x.total, "Anulada": x.voided ? "Sí" : "No" })), "Ventas");
-      const name = `Santorini-reporte-${b.turno ? "turno" : b.from + (b.to !== b.from ? "_a_" + b.to : "")}.xlsx`;
-      XLSX.writeFile(wb, name); toast("Reporte descargado");
+      const ExcelJS = await loadExcelJS(); const wb = new ExcelJS.Workbook(); wb.creator = "Santorini Club";
+      const sub = `${periodTxt} · generado ${fdt(nowIso())}`;
+      xlTable(wb, "Resumen", [{ h: "Periodo", w: 40 }, { h: "Total vendido", money: 1 }, { h: "N° de ventas" }, { h: "Venta promedio", money: 1 }, { h: "Efectivo", money: 1 }, { h: "Transferencias", money: 1 }, { h: "Ventas anuladas" }, { h: "Por cobrar pendiente", money: 1 }],
+        [{ "Periodo": periodTxt, "Total vendido": r.total, "N° de ventas": r.count, "Venta promedio": Math.round(r.avg), "Efectivo": r.byMethod.efectivo, "Transferencias": r.byMethod.transfer, "Ventas anuladas": r.voided.length, "Por cobrar pendiente": pend }], { title: "Santorini Club · Reporte de ventas", subtitle: sub });
+      xlTable(wb, "Por noche", [{ h: "Noche", w: 18 }, { h: "Fecha" }, { h: "Total", money: 1, sum: 1 }], r.nights.map(([k, v]) => ({ "Noche": nightLabel(k), "Fecha": k, "Total": v })));
+      xlTable(wb, "Por hora", [{ h: "Hora" }, { h: "Total", money: 1, sum: 1 }], r.hours.map(([h, v]) => ({ "Hora": hLabel(h), "Total": v })));
+      xlTable(wb, "Productos", [{ h: "Producto", w: 30 }, { h: "Cantidad", sum: 1 }, { h: "Valor", money: 1, sum: 1 }, { h: "% de ventas" }], r.products.map(p => ({ "Producto": p.name, "Cantidad": p.q, "Valor": p.v, "% de ventas": +(p.v / (r.total || 1) * 100).toFixed(1) })));
+      xlTable(wb, "Categorías", [{ h: "Categoría" }, { h: "Valor", money: 1, sum: 1 }], r.cats.map(([n, v]) => ({ "Categoría": n, "Valor": v })));
+      xlTable(wb, "Cajeros", [{ h: "Cajero" }, { h: "Ventas", sum: 1 }, { h: "Valor", money: 1, sum: 1 }], r.cashiers.map(([n, c]) => ({ "Cajero": n, "Ventas": c.n, "Valor": c.v })));
+      xlTable(wb, "Ventas", [{ h: "Fecha y hora" }, { h: "Noche" }, { h: "Cuenta" }, { h: "Productos", w: 50, wrap: 1 }, { h: "Forma de pago" }, { h: "Cobró" }, { h: "Total", money: 1, sum: 1 }, { h: "Anulada" }],
+        r.list.map(x => ({ "Fecha y hora": fdt(x.at), "Noche": nightKey(x.at), "Cuenta": x.account || "Venta rápida", "Productos": (x.items || []).map(i => `${i.qty}× ${i.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Cobró": x.byName || "", "Total": x.voided ? 0 : x.total, "Anulada": x.voided ? "Sí" : "No" })));
+      await xlDownload(wb, `Santorini-reporte-${b.turno ? "turno" : b.from + (b.to !== b.from ? "_a_" + b.to : "")}.xlsx`); toast("Reporte descargado");
     } catch (ex) { console.error(ex); toast("No se pudo generar el Excel. Revisa la conexión."); }
   });
 }
 
-/* ---------- RESPALDO EN EXCEL ---------- */
-function loadXLSX() {
-  if (window.XLSX) return Promise.resolve(window.XLSX);
+/* ---------- EXCEL: tablas con formato (ExcelJS) ---------- */
+function loadExcelJS() {
+  if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
   return new Promise((ok, ko) => {
     const sc = document.createElement("script");
-    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-    sc.onload = () => ok(window.XLSX); sc.onerror = () => ko(new Error("xlsx"));
+    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js";
+    sc.onload = () => ok(window.ExcelJS); sc.onerror = () => ko(new Error("xlsx"));
     document.head.appendChild(sc);
   });
 }
 const fdt = iso => { if (!iso) return ""; const d = new Date(iso); const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
+const XL_MONEY = '"$" #,##0;[Red]-"$" #,##0';
+// Agrega una hoja con una tabla de Excel real: encabezados, filtros, filas alternadas y fila de totales.
+// cols: [{h: "Encabezado", money?, sum?, w?}]
+function xlTable(wb, sheet, cols, rows, opts = {}) {
+  const ws = wb.addWorksheet(sheet, { views: [{ state: "frozen", ySplit: (opts.title ? 3 : 1) }] });
+  let ref = "A1";
+  if (opts.title) {
+    ws.getCell("A1").value = opts.title; ws.getCell("A1").font = { bold: true, size: 14, color: { argb: "FF9C7425" } };
+    if (opts.subtitle) { ws.getCell("A2").value = opts.subtitle; ws.getCell("A2").font = { italic: true, color: { argb: "FF666666" } }; }
+    ref = "A3";
+  }
+  if (!rows.length) { ws.getCell(ref).value = opts.empty || "Sin datos en el periodo"; return ws; }
+  const hasTotals = cols.some(c => c.sum);
+  ws.addTable({
+    name: sheet.replace(/[^A-Za-z0-9]/g, "") + "Tabla", ref, headerRow: true, totalsRow: hasTotals,
+    style: { theme: "TableStyleMedium7", showRowStripes: true },
+    columns: cols.map((c, i) => ({ name: c.h, filterButton: true, totalsRowFunction: c.sum ? "sum" : "none", totalsRowLabel: i === 0 && hasTotals ? "TOTAL" : undefined,
+      totalsRowResult: c.sum ? rows.reduce((t, r) => t + (typeof r[c.h] === "number" ? r[c.h] : 0), 0) : undefined })),
+    rows: rows.map(r => cols.map(c => { const v = r[c.h]; return v === undefined || v === null ? "" : v; }))
+  });
+  cols.forEach((c, i) => {
+    const col = ws.getColumn(i + 1);
+    col.width = c.w || Math.max(10, Math.min(60, c.h.length + 3, ...rows.slice(0, 300).map(r => String(r[c.h] ?? "").length + 2)));
+    if (c.money) col.numFmt = XL_MONEY;
+    if (c.wrap) col.alignment = { wrapText: true, vertical: "top" };
+  });
+  return ws;
+}
+async function xlDownload(wb, name) {
+  const buf = await wb.xlsx.writeBuffer();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+  a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+}
+
+// Lee de Firebase todo lo necesario para los turnos indicados.
+async function collectSessions(sess, onStep) {
+  const out = [];
+  let i = 0;
+  for (const s of sess) {
+    onStep && onStep(++i, sess.length);
+    const [sl, ex] = await Promise.all([
+      s.id === current ? Promise.resolve(null) : getDocs(query(collection(db, "sessions", s.id, "sales"), orderBy("at"))),
+      getDocs(query(collection(db, "sessions", s.id, "expenses"), orderBy("at")))
+    ]);
+    const salesList = sl ? sl.docs.map(d => ({ id: d.id, ...d.data() })) : sales.slice();
+    out.push({ s, sales: salesList, expenses: ex.docs.map(d => d.data()) });
+  }
+  return out;
+}
+
+// Una fila con todos los detalles de un cierre de caja.
+function closingRow(n, { s, sales: sl, expenses: ex }) {
+  const valid = sl.filter(x => !x.voided), voided = sl.filter(x => x.voided);
+  const sum = a => a.reduce((t, x) => t + (x.total || 0), 0);
+  const ef = sum(valid.filter(x => x.method === "efectivo")), tr = sum(valid.filter(x => x.method === "transfer"));
+  const quick = valid.filter(x => !x.account), tabsV = valid.filter(x => x.account && !x.receivableId), recV = valid.filter(x => x.receivableId);
+  const exp = ex.reduce((t, x) => t + (x.amount || 0), 0);
+  const expected = s.expected ?? ((s.base || 0) + ef - exp);
+  const prod = new Map(); valid.forEach(x => (x.items || []).forEach(l => { const p = prod.get(l.name) || { q: 0, v: 0 }; p.q += l.qty; p.v += l.qty * l.price; prod.set(l.name, p); }));
+  const top = [...prod].sort((a, b) => b[1].q - a[1].q)[0];
+  const sm = s.summary || {};
+  const hours = s.closedAt ? Math.round((new Date(s.closedAt) - new Date(s.openedAt)) / 36e5 * 10) / 10 : "";
+  const diff = s.closedAt ? (s.diff ?? (s.counted - expected)) : "";
+  return {
+    "N°": n, "Estado": s.closedAt ? "Cerrada" : "Abierta", "Apertura": fdt(s.openedAt), "Cierre": s.closedAt ? fdt(s.closedAt) : "", "Duración (horas)": hours,
+    "Abrió": s.openedByName || "", "Cerró": s.closedByName || "", "Nota de apertura": s.note || "",
+    "Base inicial": s.base || 0, "Ventas en efectivo": ef, "Transferencias": tr, "Total vendido": ef + tr,
+    "N° de ventas": valid.length, "Ventas rápidas (cant.)": quick.length, "Ventas rápidas ($)": sum(quick),
+    "Mesas y clientes (cant.)": tabsV.length, "Mesas y clientes ($)": sum(tabsV),
+    "Cuentas por cobrar cobradas (cant.)": recV.length, "Cuentas por cobrar cobradas ($)": sum(recV),
+    "Ventas anuladas (cant.)": voided.length, "Ventas anuladas ($)": sum(voided),
+    "Salidas (cant.)": ex.length, "Salidas ($)": exp, "Detalle de salidas": ex.map(x => `${x.concept}: ${fmt(x.amount)}`).join("; "),
+    "Efectivo esperado": expected, "Efectivo contado": s.closedAt ? (s.counted ?? "") : "", "Diferencia": diff,
+    "Resultado": !s.closedAt ? "" : diff === 0 ? "Cuadra" : diff > 0 ? "Sobrante" : "Faltante",
+    "Quedaron por cobrar (cant.)": sm.pendingCount || 0, "Quedaron por cobrar ($)": sm.pendingTotal || 0,
+    "Cuentas que quedaron por cobrar": (sm.pendingList || []).map(p => `${p.label} (${fmt(p.total)})`).join("; "),
+    "Producto más vendido": top ? `${top[0]} (${top[1].q} und)` : "", "Unidades vendidas": [...prod.values()].reduce((t, p) => t + p.q, 0),
+    "Observaciones del cierre": s.closeNote || ""
+  };
+}
+const CLOSING_COLS = [
+  { h: "N°", w: 5 }, { h: "Estado" }, { h: "Apertura" }, { h: "Cierre" }, { h: "Duración (horas)", w: 10 }, { h: "Abrió" }, { h: "Cerró" }, { h: "Nota de apertura", w: 24 },
+  { h: "Base inicial", money: 1, sum: 1 }, { h: "Ventas en efectivo", money: 1, sum: 1 }, { h: "Transferencias", money: 1, sum: 1 }, { h: "Total vendido", money: 1, sum: 1, w: 16 },
+  { h: "N° de ventas", sum: 1 }, { h: "Ventas rápidas (cant.)", sum: 1 }, { h: "Ventas rápidas ($)", money: 1, sum: 1 },
+  { h: "Mesas y clientes (cant.)", sum: 1 }, { h: "Mesas y clientes ($)", money: 1, sum: 1 },
+  { h: "Cuentas por cobrar cobradas (cant.)", sum: 1 }, { h: "Cuentas por cobrar cobradas ($)", money: 1, sum: 1 },
+  { h: "Ventas anuladas (cant.)", sum: 1 }, { h: "Ventas anuladas ($)", money: 1, sum: 1 },
+  { h: "Salidas (cant.)", sum: 1 }, { h: "Salidas ($)", money: 1, sum: 1 }, { h: "Detalle de salidas", w: 34, wrap: 1 },
+  { h: "Efectivo esperado", money: 1, sum: 1 }, { h: "Efectivo contado", money: 1, sum: 1 }, { h: "Diferencia", money: 1, sum: 1 }, { h: "Resultado" },
+  { h: "Quedaron por cobrar (cant.)", sum: 1 }, { h: "Quedaron por cobrar ($)", money: 1, sum: 1 }, { h: "Cuentas que quedaron por cobrar", w: 34, wrap: 1 },
+  { h: "Producto más vendido", w: 28 }, { h: "Unidades vendidas", sum: 1 }, { h: "Observaciones del cierre", w: 34, wrap: 1 }
+];
+
+// Arma el libro de Excel completo para una lista de turnos.
+async function buildClosingsWorkbook(data, { title, subtitle, recs }) {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook(); wb.creator = "Santorini Club"; wb.created = new Date();
+  const label = s => `${fdt(s.openedAt)}${s.closedAt ? " → " + fdt(s.closedAt) : " (abierta)"}`;
+  xlTable(wb, "Cierres", CLOSING_COLS, data.map((d, i) => closingRow(i + 1, d)), { title, subtitle, empty: "No hay cierres en el periodo" });
+  const ventas = [], prods = [], pedidos = [], salidas = [], porProd = new Map();
+  for (const { s, sales: sl, expenses: ex } of data) {
+    const turno = label(s);
+    for (const x of sl) {
+      const cuenta = x.account || "Venta rápida", anul = x.voided ? "Sí" : "No";
+      ventas.push({ "Cierre": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Tipo": x.receivableId ? "Cuenta por cobrar" : x.account ? "Mesa/Cliente" : "Venta rápida",
+        "Productos": (x.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Referencia": x.reference || "",
+        "Capture": x.receiptId ? "Sí" : "No", "Cobró": x.byName || "", "Total": x.voided ? 0 : x.total, "Valor anulado": x.voided ? x.total : 0, "Anulada": anul });
+      for (const l of x.items || []) {
+        prods.push({ "Cierre": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Producto": l.name, "Cantidad": x.voided ? 0 : l.qty, "Precio": l.price, "Subtotal": x.voided ? 0 : l.qty * l.price, "Anulada": anul });
+        if (!x.voided) { const k = turno + "|" + l.name; const p = porProd.get(k) || { "Cierre": turno, "Producto": l.name, "Cantidad": 0, "Valor": 0 }; p["Cantidad"] += l.qty; p["Valor"] += l.qty * l.price; porProd.set(k, p); }
+      }
+      for (const l of x.lines || []) pedidos.push({ "Cierre": turno, "Cuenta": cuenta, "Hora del pedido": fdt(l.at), "Producto": l.name, "Cantidad": l.qty, "Precio": l.price, "Valor": l.qty * l.price, "Anotó": l.byName || "", "Retirado": l.qty < 0 ? "Sí" : "" });
+    }
+    for (const x of ex) salidas.push({ "Cierre": turno, "Fecha y hora": fdt(x.at), "Concepto": x.concept, "Registró": x.byName || "", "Valor": x.amount });
+  }
+  xlTable(wb, "Productos por cierre", [{ h: "Cierre", w: 34 }, { h: "Producto", w: 30 }, { h: "Cantidad", sum: 1 }, { h: "Valor", money: 1, sum: 1 }], [...porProd.values()]);
+  xlTable(wb, "Ventas", [{ h: "Cierre", w: 34 }, { h: "Fecha y hora" }, { h: "Cuenta" }, { h: "Tipo" }, { h: "Productos", w: 50, wrap: 1 }, { h: "Forma de pago" }, { h: "Referencia" }, { h: "Capture" }, { h: "Cobró" }, { h: "Total", money: 1, sum: 1 }, { h: "Valor anulado", money: 1, sum: 1 }, { h: "Anulada" }], ventas);
+  xlTable(wb, "Productos vendidos", [{ h: "Cierre", w: 34 }, { h: "Fecha y hora" }, { h: "Cuenta" }, { h: "Producto", w: 30 }, { h: "Cantidad", sum: 1 }, { h: "Precio", money: 1 }, { h: "Subtotal", money: 1, sum: 1 }, { h: "Anulada" }], prods);
+  xlTable(wb, "Pedidos con hora", [{ h: "Cierre", w: 34 }, { h: "Cuenta" }, { h: "Hora del pedido" }, { h: "Producto", w: 30 }, { h: "Cantidad", sum: 1 }, { h: "Precio", money: 1 }, { h: "Valor", money: 1, sum: 1 }, { h: "Anotó" }, { h: "Retirado" }], pedidos, { empty: "Sin pedidos de mesas en el periodo" });
+  xlTable(wb, "Salidas", [{ h: "Cierre", w: 34 }, { h: "Fecha y hora" }, { h: "Concepto", w: 34 }, { h: "Registró" }, { h: "Valor", money: 1, sum: 1 }], salidas, { empty: "Sin salidas en el periodo" });
+  if (recs) {
+    const EST = { pending: "Pendiente", paid: "Cobrada", void: "Anulada" };
+    xlTable(wb, "Por cobrar", [{ h: "Cuenta" }, { h: "Turno" }, { h: "Quedó pendiente" }, { h: "Productos", w: 50, wrap: 1 }, { h: "Total", money: 1, sum: 1 }, { h: "Estado" }, { h: "Cobrada el" }, { h: "Cobró" }, { h: "Forma de pago" }],
+      recs.map(r => ({ "Cuenta": r.label, "Turno": fdt(r.sessionOpenedAt), "Quedó pendiente": fdt(r.closedAt), "Productos": (r.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Total": r.total, "Estado": EST[r.status] || r.status, "Cobrada el": fdt(r.paidAt), "Cobró": r.paidByName || "", "Forma de pago": METHODS[r.method] || "" })),
+      { empty: "Sin cuentas por cobrar" });
+    xlTable(wb, "Inventario", [{ h: "Producto", w: 30 }, { h: "Categoría" }, { h: "Precio", money: 1 }, { h: "Stock" }, { h: "Estado" }],
+      products.map(p => ({ "Producto": p.name, "Categoría": p.category, "Precio": p.price, "Stock": p.stock === null ? "Sin control" : p.stock, "Estado": p.active ? "Activo" : "Oculto" })));
+    xlTable(wb, "Usuarios", [{ h: "Nombre" }, { h: "Usuario" }, { h: "Rol" }, { h: "Estado" }],
+      users.map(u => ({ "Nombre": u.name, "Usuario": u.user, "Rol": u.role === "admin" ? "Administrador" : "Cajero", "Estado": u.active ? "Activo" : "Desactivado" })));
+  }
+  return wb;
+}
+
 function backupModal() {
-  modal(`<h3>Descargar respaldo</h3>
-  <p class="muted" style="margin:0">Se descarga un archivo de Excel con cierres, ventas, productos vendidos, pedidos con hora, salidas, cuentas por cobrar, productos y usuarios (sin contraseñas). Guárdalo en tu computador o en Drive.</p>
+  modal(`<h3>Descargar cierres en Excel</h3>
+  <p class="muted" style="margin:0">Descarga un archivo de Excel con la tabla de cierres de caja con todos sus detalles (base, ventas, transferencias, salidas, cuadre, cuentas por cobrar, observaciones), más las hojas de ventas, productos por cierre, pedidos con hora, salidas, cuentas por cobrar, inventario y usuarios.</p>
   <div class="field"><label class="label" for="bkRange">Periodo</label><select class="input" id="bkRange">
     <option value="7">Últimos 7 días</option><option value="31" selected>Últimos 30 días</option><option value="92">Últimos 3 meses</option><option value="0">Todo</option></select></div>
+  <label class="chk"><input type="checkbox" id="bkOpen"> Incluir el turno abierto</label>
   <div class="muted small" id="bkMsg"></div>
   <div class="modal-f"><button class="btn btn-ghost" data-x>Cancelar</button><button class="btn btn-gold" data-ok>Descargar Excel</button></div>`, (m, close) => {
     m.querySelector("[data-x]").onclick = close;
@@ -1192,48 +1330,33 @@ function backupModal() {
       const msg = m.querySelector("#bkMsg");
       try {
         msg.textContent = "Preparando…";
-        const XLSX = await loadXLSX();
-        const days = +m.querySelector("#bkRange").value;
+        await loadExcelJS();
+        const days = +m.querySelector("#bkRange").value, withOpen = m.querySelector("#bkOpen").checked;
         const since = days ? new Date(Date.now() - days * 864e5).toISOString() : "";
         const sess = (await getDocs(collection(db, "sessions"))).docs.map(d => ({ id: d.id, ...d.data() }))
-          .filter(s => !since || (s.closedAt || s.openedAt) >= since).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
-        const R = { cierres: [], ventas: [], productos: [], pedidos: [], salidas: [] };
-        let i = 0;
-        for (const s of sess) {
-          msg.textContent = `Leyendo turno ${++i} de ${sess.length}…`;
-          const [sl, ex] = await Promise.all([getDocs(query(collection(db, "sessions", s.id, "sales"), orderBy("at"))), getDocs(query(collection(db, "sessions", s.id, "expenses"), orderBy("at")))]);
-          const turno = fdt(s.openedAt), sm = s.summary || {};
-          R.cierres.push({ "Apertura": turno, "Cierre": s.closedAt ? fdt(s.closedAt) : "ABIERTA", "Abrió": s.openedByName || "", "Cerró": s.closedByName || "", "Base": s.base || 0,
-            "Ventas efectivo": sm.by?.efectivo ?? "", "Transferencias": sm.by?.transfer ?? "", "Total vendido": sm.sales ?? "", "Salidas": sm.exp ?? "",
-            "Efectivo esperado": s.expected ?? "", "Efectivo contado": s.counted ?? "", "Diferencia": s.diff ?? "", "Quedaron por cobrar": sm.pendingTotal || 0, "Observaciones": s.closeNote || "" });
-          for (const d of sl.docs) {
-            const x = d.data(), cuenta = x.account || "Venta rápida", anul = x.voided ? "Sí" : "No";
-            R.ventas.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Tipo": x.receivableId ? "Cuenta por cobrar" : x.account ? "Mesa/Cliente" : "Venta rápida",
-              "Productos": (x.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Referencia": x.reference || "",
-              "Capture": x.receiptId ? "Sí" : "No", "Cobró": x.byName || "", "Total": x.total, "Anulada": anul });
-            for (const l of x.items || []) R.productos.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Producto": l.name, "Cantidad": l.qty, "Precio": l.price, "Subtotal": l.qty * l.price, "Anulada": anul });
-            for (const l of x.lines || []) R.pedidos.push({ "Turno": turno, "Cuenta": cuenta, "Hora del pedido": fdt(l.at), "Producto": l.name, "Cantidad": l.qty, "Precio": l.price, "Anotó": l.byName || "", "Retirado": l.qty < 0 ? "Sí" : "" });
-          }
-          for (const d of ex.docs) { const x = d.data(); R.salidas.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Concepto": x.concept, "Registró": x.byName || "", "Valor": x.amount }); }
-        }
-        msg.textContent = "Leyendo cuentas por cobrar y productos…";
+          .filter(s => (s.closedAt || withOpen) && (!since || (s.closedAt || s.openedAt) >= since)).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+        const data = await collectSessions(sess, (i, n) => { msg.textContent = `Leyendo cierre ${i} de ${n}…`; });
+        msg.textContent = "Leyendo cuentas por cobrar…";
         const recs = (await getDocs(collection(db, "receivables"))).docs.map(d => d.data()).filter(r => !since || (r.closedAt || "") >= since || r.status === "pending");
-        const EST = { pending: "Pendiente", paid: "Cobrada", void: "Anulada" };
-        const wb = XLSX.utils.book_new();
-        const add = (rows, name, empty) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "": empty }]); ws["!cols"] = Object.keys(rows[0] || { "": 1 }).map(k => ({ wch: Math.max(10, Math.min(45, k.length + 4, ...rows.slice(0, 200).map(r => String(r[k] ?? "").length + 2))) })); XLSX.utils.book_append_sheet(wb, ws, name); };
-        add(R.cierres, "Cierres", "Sin turnos en el periodo");
-        add(R.ventas, "Ventas", "Sin ventas");
-        add(R.productos, "Productos vendidos", "Sin ventas");
-        add(R.pedidos, "Pedidos con hora", "Sin pedidos de mesas");
-        add(R.salidas, "Salidas", "Sin salidas");
-        add(recs.map(r => ({ "Cuenta": r.label, "Turno": fdt(r.sessionOpenedAt), "Quedó pendiente": fdt(r.closedAt), "Productos": (r.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Total": r.total, "Estado": EST[r.status] || r.status, "Cobrada el": fdt(r.paidAt), "Cobró": r.paidByName || "", "Forma de pago": METHODS[r.method] || "" })), "Por cobrar", "Sin cuentas por cobrar");
-        add(products.map(p => ({ "Producto": p.name, "Categoría": p.category, "Precio": p.price, "Stock": p.stock === null ? "Sin control" : p.stock, "Estado": p.active ? "Activo" : "Oculto" })), "Inventario", "Sin productos");
-        add(users.map(u => ({ "Nombre": u.name, "Usuario": u.user, "Rol": u.role === "admin" ? "Administrador" : "Cajero", "Estado": u.active ? "Activo" : "Desactivado" })), "Usuarios", "Sin usuarios");
-        const name = `Santorini-respaldo-${fdt(nowIso()).slice(0, 10)}.xlsx`;
-        XLSX.writeFile(wb, name);
-        close(); toast("Respaldo descargado: " + name);
-      } catch (ex) { console.error(ex); msg.textContent = ex.message === "xlsx" ? "No se pudo cargar el generador de Excel. Revisa la conexión." : "No se pudo preparar el respaldo (" + (ex.code || ex.message) + ")."; }
+        msg.textContent = "Armando el archivo…";
+        const period = m.querySelector("#bkRange").selectedOptions[0].textContent;
+        const wb = await buildClosingsWorkbook(data, { title: "Santorini Club · Cierres de caja", subtitle: `${period} · ${data.length} turno${data.length === 1 ? "" : "s"} · generado ${fdt(nowIso())} por ${me.name}`, recs });
+        const name = `Santorini-cierres-${fdt(nowIso()).slice(0, 10)}.xlsx`;
+        await xlDownload(wb, name);
+        close(); toast("Excel descargado: " + name);
+      } catch (ex) { console.error(ex); msg.textContent = ex.message === "xlsx" ? "No se pudo cargar el generador de Excel. Revisa la conexión." : "No se pudo preparar el archivo (" + (ex.code || ex.message) + ")."; }
     });
+  });
+}
+// Excel de un solo cierre (desde el detalle del cierre).
+async function downloadOneClosing(s, btn) {
+  await busy(btn, async () => {
+    try {
+      const data = await collectSessions([s]);
+      const wb = await buildClosingsWorkbook(data, { title: "Santorini Club · Cierre de caja", subtitle: `${fdt(s.openedAt)} → ${fdt(s.closedAt)} · cerró ${s.closedByName || ""}` });
+      await xlDownload(wb, `Santorini-cierre-${fdt(s.closedAt || s.openedAt).slice(0, 10)}.xlsx`);
+      toast("Excel del cierre descargado");
+    } catch (ex) { console.error(ex); toast(ex.message === "xlsx" ? "No se pudo cargar el generador de Excel." : "No se pudo generar el Excel."); }
   });
 }
 
