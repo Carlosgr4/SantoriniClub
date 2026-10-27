@@ -1,0 +1,70 @@
+rules_version = '2';
+// Reglas de seguridad de Santorini Club · Caja
+// Copiar en Firebase Console → Firestore Database → Reglas → Publicar.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function setupPath() { return /databases/$(database)/documents/meta/setup; }
+    function isActive() { return signedIn() && exists(profilePath()) && get(profilePath()).data.active == true; }
+    function isAdmin() { return isActive() && get(profilePath()).data.role == 'admin'; }
+    // Primera vez: el administrador inicial se crea junto con meta/setup en una sola operación.
+    function bootstrapping() { return signedIn() && !exists(setupPath()) && existsAfter(setupPath()); }
+
+    match /meta/setup {
+      allow read: if true;
+      allow create: if signedIn() && !exists(setupPath())
+        && getAfter(profilePath()).data.role == 'admin';
+    }
+
+    match /meta/state {
+      allow read: if isActive();
+      allow write: if isActive() || bootstrapping();
+    }
+
+    match /users/{uid} {
+      allow read: if isActive() || request.auth.uid == uid;
+      allow create: if isAdmin()
+        || (request.auth.uid == uid && bootstrapping() && request.resource.data.role == 'admin');
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    match /products/{id} {
+      allow read: if isActive();
+      allow create, delete: if isAdmin();
+      // Los cajeros solo pueden cambiar el stock (al vender).
+      allow update: if isAdmin()
+        || (isActive() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stock']));
+    }
+
+    match /sessions/{sid} {
+      allow read, create, update: if isActive();
+      allow delete: if false;
+
+      match /sales/{saleId} {
+        allow read, create: if isActive();
+        allow update: if isAdmin();   // anular ventas
+        allow delete: if false;
+      }
+      match /expenses/{expId} {
+        allow read, create: if isActive();
+        allow update, delete: if false;
+      }
+      // Cuentas abiertas por mesa o cliente (se cobran al final).
+      match /tabs/{tabId} {
+        allow read, create, update: if isActive();
+        allow delete: if false;
+      }
+    }
+
+    // Captures de transferencias (imagen reducida, guardada como texto).
+    match /receipts/{id} {
+      allow read: if isActive();
+      allow create: if isActive() && request.resource.data.img is string
+        && request.resource.data.img.size() < 900000;
+      allow update, delete: if false;
+    }
+  }
+}
