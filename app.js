@@ -631,8 +631,8 @@ function payModal(t, rec) {
   });
 }
 
-async function receiptModal(id) {
-  const close = modal(`<h3>Capture de transferencia</h3><div class="loading" style="min-height:120px">Cargando…</div><div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; });
+async function receiptModal(id, onBack) {
+  const close = modal(`<h3>Capture de transferencia</h3><div class="loading" style="min-height:120px">Cargando…</div><div class="modal-f">${onBack ? `<button class="btn btn-ghost" data-b>Volver al cierre</button>` : ""}<button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; m.querySelector("[data-b]")?.addEventListener("click", () => { c(); onBack(); }); });
   try {
     const s = await getDoc(doc(db, "receipts", id));
     const box = $("#modalRoot .modal"); if (!box) return;
@@ -641,7 +641,7 @@ async function receiptModal(id) {
 }
 
 // Desglose de una venta ya cobrada (desde Movimientos).
-function saleDetailModal(x) {
+function saleDetailModal(x, onBack) {
   const lines = x.lines || [];
   const fake = { id: "_s", items: [], openedAt: x.at };
   tabLines._s = lines.map((l, i) => ({ id: "l" + i, ...l }));
@@ -652,7 +652,10 @@ function saleDetailModal(x) {
     <div class="ord-i">${r.agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ")}${r.rem.length ? ` <span class="muted">(${r.rem.length} retirado${r.rem.length > 1 ? "s" : ""})</span>` : ""}</div></div>`; }).join("")}
   <div class="sum num">${x.items.map(i => `<div><span>${i.qty}× ${esc(i.name)}</span><span>${fmt(i.qty * i.price)}</span></div>`).join("")}</div>
   <div class="total"><span class="label">Total</span><span class="v num gold-text">${fmt(x.total)}</span></div>
-  <div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; });
+  <div class="modal-f">${onBack ? `<button class="btn btn-ghost" data-b>Volver al cierre</button>` : ""}<button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => {
+    m.querySelector("[data-x]").onclick = c;
+    m.querySelector("[data-b]")?.addEventListener("click", () => { c(); onBack(); });
+  });
 }
 
 /* ---------- cuentas por cobrar de cierres anteriores ---------- */
@@ -827,10 +830,30 @@ function reportText(s) {
   const t = s.summary;
   return `SANTORINI CLUB - CIERRE DE CAJA\n${dt(s.openedAt)} a ${dt(s.closedAt)}\nAbrió: ${s.openedByName} | Cerró: ${s.closedByName}\nBase: ${fmt(s.base)}\nEfectivo: ${fmt(t.by.efectivo)}\nTransferencias: ${fmt(t.by.transfer)}\nSalidas: ${fmt(t.exp)}\nTOTAL VENDIDO: ${fmt(t.sales)}\nEsperado en caja: ${fmt(s.expected)}\nContado: ${fmt(s.counted)}\nDiferencia: ${s.diff >= 0 ? "+" : "-"}${fmt(Math.abs(s.diff))}${t.pendingCount ? "\nQuedaron por cobrar: " + t.pendingCount + " cuentas, " + fmt(t.pendingTotal) + "\n" + t.pendingList.map(p => "- " + p.label + ": " + fmt(p.total)).join("\n") : ""}${s.closeNote ? "\nObs: " + s.closeNote : ""}`;
 }
+const saleCache = {}; // ventas de cada turno ya consultadas
 function reportModal(s) {
-  modal(reportHTML(s) + `<div class="modal-f"><button class="btn" data-copy>Copiar resumen</button><button class="btn btn-gold" data-x>Listo</button></div>`, (m, close) => {
+  modal(reportHTML(s) + `<div class="paidlist" data-paid><div class="label">Cuentas cobradas en este turno</div><div class="muted small">Cargando…</div></div>
+  <div class="modal-f"><button class="btn" data-copy>Copiar resumen</button><button class="btn btn-gold" data-x>Listo</button></div>`, async (m, close) => {
     m.querySelector("[data-x]").onclick = close;
     m.querySelector("[data-copy]").onclick = () => { navigator.clipboard.writeText(reportText(s)).then(() => toast("Resumen copiado, pégalo en WhatsApp"), () => toast("No se pudo copiar")); };
+    const box = m.querySelector("[data-paid]");
+    let list = saleCache[s.id];
+    if (!list) {
+      try { list = (await getDocs(query(collection(db, "sessions", s.id, "sales"), orderBy("at")))).docs.map(d => ({ id: d.id, ...d.data() })); saleCache[s.id] = list; }
+      catch (e) { box.innerHTML = `<div class="err">No se pudieron cargar las ventas de este turno.</div>`; return; }
+    }
+    if (!box.isConnected) return;
+    const back = () => reportModal(s);
+    const accounts = list.filter(x => x.account), quick = list.filter(x => !x.account && !x.voided);
+    const quickTotal = quick.reduce((a, x) => a + x.total, 0);
+    box.innerHTML = `<div class="label">Cuentas cobradas en este turno (${accounts.filter(x => !x.voided).length})</div>
+      ${accounts.length ? `<div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Cuenta</th><th>Pago</th><th>Cobró</th><th class="r">Total</th></tr></thead><tbody>
+      ${accounts.map(x => `<tr class="${x.voided ? "voided" : ""}"><td class="num">${tm(x.at)}</td><td><button class="link" data-s="${x.id}">${esc(x.account)}</button>${x.voided ? ' <span class="pill void">Anulada</span>' : ""}</td>
+        <td>${esc(METHODS[x.method] || x.method)}${x.receiptId ? ` · <button class="link small" data-rc="${x.receiptId}">capture</button>` : ""}</td><td>${esc(x.byName)}</td><td class="r num">${fmt(x.total)}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="muted small">No se cobraron cuentas de mesas o clientes en este turno.</div>`}
+      <div class="sum num"><div><span>Ventas rápidas (${quick.length})</span><span>${fmt(quickTotal)}</span></div></div>`;
+    box.querySelectorAll("[data-s]").forEach(b => b.onclick = () => saleDetailModal(list.find(y => y.id === b.dataset.s), back));
+    box.querySelectorAll("[data-rc]").forEach(b => b.onclick = () => receiptModal(b.dataset.rc, back));
   });
 }
 
@@ -979,12 +1002,81 @@ async function viewHist(v) {
   } catch (e) { fail(e, "No se pudieron leer los cierres."); }
   if (tab !== "hist") return;
   const sum = closed.reduce((a, s) => a + (s.summary?.sales || 0), 0);
-  v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${closed.length} turnos cerrados · ${fmt(sum)} vendidos</div><h2>Cierres de caja</h2></div></div>
+  v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${closed.length} turnos cerrados · ${fmt(sum)} vendidos</div><h2>Cierres de caja</h2></div><button class="btn btn-gold" id="bkBtn">Descargar respaldo</button></div>
   <div class="panel"><div class="tbl-wrap"><table><thead><tr><th>Apertura</th><th>Cierre</th><th>Cajero</th><th class="r">Vendido</th><th class="r">Efectivo esperado</th><th class="r">Contado</th><th>Resultado</th><th></th></tr></thead><tbody>
   ${closed.map(s => `<tr><td class="num">${dt(s.openedAt)}</td><td class="num">${dt(s.closedAt)}</td><td>${esc(s.openedByName)}${s.closedByName !== s.openedByName ? " / " + esc(s.closedByName) : ""}</td>
   <td class="r num"><b>${fmt(s.summary.sales)}</b></td><td class="r num">${fmt(s.expected)}</td><td class="r num">${fmt(s.counted)}</td><td>${diffPill(s.diff)}</td><td><button class="btn btn-sm" data-rep="${s.id}">Ver</button></td></tr>`).join("") || `<tr><td colspan="8" class="empty">Todavía no hay cierres. Aparecerán aquí cada vez que se cierre la caja.</td></tr>`}
   </tbody></table></div></div></div>`;
   v.querySelectorAll("[data-rep]").forEach(b => b.onclick = () => reportModal(closed.find(s => s.id === b.dataset.rep)));
+  $("#bkBtn").onclick = backupModal;
+}
+
+/* ---------- RESPALDO EN EXCEL ---------- */
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((ok, ko) => {
+    const sc = document.createElement("script");
+    sc.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    sc.onload = () => ok(window.XLSX); sc.onerror = () => ko(new Error("xlsx"));
+    document.head.appendChild(sc);
+  });
+}
+const fdt = iso => { if (!iso) return ""; const d = new Date(iso); const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
+function backupModal() {
+  modal(`<h3>Descargar respaldo</h3>
+  <p class="muted" style="margin:0">Se descarga un archivo de Excel con cierres, ventas, productos vendidos, pedidos con hora, salidas, cuentas por cobrar, productos y usuarios (sin contraseñas). Guárdalo en tu computador o en Drive.</p>
+  <div class="field"><label class="label" for="bkRange">Periodo</label><select class="input" id="bkRange">
+    <option value="7">Últimos 7 días</option><option value="31" selected>Últimos 30 días</option><option value="92">Últimos 3 meses</option><option value="0">Todo</option></select></div>
+  <div class="muted small" id="bkMsg"></div>
+  <div class="modal-f"><button class="btn btn-ghost" data-x>Cancelar</button><button class="btn btn-gold" data-ok>Descargar Excel</button></div>`, (m, close) => {
+    m.querySelector("[data-x]").onclick = close;
+    m.querySelector("[data-ok]").onclick = e => busy(e.currentTarget, async () => {
+      const msg = m.querySelector("#bkMsg");
+      try {
+        msg.textContent = "Preparando…";
+        const XLSX = await loadXLSX();
+        const days = +m.querySelector("#bkRange").value;
+        const since = days ? new Date(Date.now() - days * 864e5).toISOString() : "";
+        const sess = (await getDocs(collection(db, "sessions"))).docs.map(d => ({ id: d.id, ...d.data() }))
+          .filter(s => !since || (s.closedAt || s.openedAt) >= since).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
+        const R = { cierres: [], ventas: [], productos: [], pedidos: [], salidas: [] };
+        let i = 0;
+        for (const s of sess) {
+          msg.textContent = `Leyendo turno ${++i} de ${sess.length}…`;
+          const [sl, ex] = await Promise.all([getDocs(query(collection(db, "sessions", s.id, "sales"), orderBy("at"))), getDocs(query(collection(db, "sessions", s.id, "expenses"), orderBy("at")))]);
+          const turno = fdt(s.openedAt), sm = s.summary || {};
+          R.cierres.push({ "Apertura": turno, "Cierre": s.closedAt ? fdt(s.closedAt) : "ABIERTA", "Abrió": s.openedByName || "", "Cerró": s.closedByName || "", "Base": s.base || 0,
+            "Ventas efectivo": sm.by?.efectivo ?? "", "Transferencias": sm.by?.transfer ?? "", "Total vendido": sm.sales ?? "", "Salidas": sm.exp ?? "",
+            "Efectivo esperado": s.expected ?? "", "Efectivo contado": s.counted ?? "", "Diferencia": s.diff ?? "", "Quedaron por cobrar": sm.pendingTotal || 0, "Observaciones": s.closeNote || "" });
+          for (const d of sl.docs) {
+            const x = d.data(), cuenta = x.account || "Venta rápida", anul = x.voided ? "Sí" : "No";
+            R.ventas.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Tipo": x.receivableId ? "Cuenta por cobrar" : x.account ? "Mesa/Cliente" : "Venta rápida",
+              "Productos": (x.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Forma de pago": METHODS[x.method] || x.method, "Referencia": x.reference || "",
+              "Capture": x.receiptId ? "Sí" : "No", "Cobró": x.byName || "", "Total": x.total, "Anulada": anul });
+            for (const l of x.items || []) R.productos.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Cuenta": cuenta, "Producto": l.name, "Cantidad": l.qty, "Precio": l.price, "Subtotal": l.qty * l.price, "Anulada": anul });
+            for (const l of x.lines || []) R.pedidos.push({ "Turno": turno, "Cuenta": cuenta, "Hora del pedido": fdt(l.at), "Producto": l.name, "Cantidad": l.qty, "Precio": l.price, "Anotó": l.byName || "", "Retirado": l.qty < 0 ? "Sí" : "" });
+          }
+          for (const d of ex.docs) { const x = d.data(); R.salidas.push({ "Turno": turno, "Fecha y hora": fdt(x.at), "Concepto": x.concept, "Registró": x.byName || "", "Valor": x.amount }); }
+        }
+        msg.textContent = "Leyendo cuentas por cobrar y productos…";
+        const recs = (await getDocs(collection(db, "receivables"))).docs.map(d => d.data()).filter(r => !since || (r.closedAt || "") >= since || r.status === "pending");
+        const EST = { pending: "Pendiente", paid: "Cobrada", void: "Anulada" };
+        const wb = XLSX.utils.book_new();
+        const add = (rows, name, empty) => { const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ "": empty }]); ws["!cols"] = Object.keys(rows[0] || { "": 1 }).map(k => ({ wch: Math.max(10, Math.min(45, k.length + 4, ...rows.slice(0, 200).map(r => String(r[k] ?? "").length + 2))) })); XLSX.utils.book_append_sheet(wb, ws, name); };
+        add(R.cierres, "Cierres", "Sin turnos en el periodo");
+        add(R.ventas, "Ventas", "Sin ventas");
+        add(R.productos, "Productos vendidos", "Sin ventas");
+        add(R.pedidos, "Pedidos con hora", "Sin pedidos de mesas");
+        add(R.salidas, "Salidas", "Sin salidas");
+        add(recs.map(r => ({ "Cuenta": r.label, "Turno": fdt(r.sessionOpenedAt), "Quedó pendiente": fdt(r.closedAt), "Productos": (r.items || []).map(l => `${l.qty}× ${l.name}`).join(", "), "Total": r.total, "Estado": EST[r.status] || r.status, "Cobrada el": fdt(r.paidAt), "Cobró": r.paidByName || "", "Forma de pago": METHODS[r.method] || "" })), "Por cobrar", "Sin cuentas por cobrar");
+        add(products.map(p => ({ "Producto": p.name, "Categoría": p.category, "Precio": p.price, "Stock": p.stock === null ? "Sin control" : p.stock, "Estado": p.active ? "Activo" : "Oculto" })), "Inventario", "Sin productos");
+        add(users.map(u => ({ "Nombre": u.name, "Usuario": u.user, "Rol": u.role === "admin" ? "Administrador" : "Cajero", "Estado": u.active ? "Activo" : "Desactivado" })), "Usuarios", "Sin usuarios");
+        const name = `Santorini-respaldo-${fdt(nowIso()).slice(0, 10)}.xlsx`;
+        XLSX.writeFile(wb, name);
+        close(); toast("Respaldo descargado: " + name);
+      } catch (ex) { console.error(ex); msg.textContent = ex.message === "xlsx" ? "No se pudo cargar el generador de Excel. Revisa la conexión." : "No se pudo preparar el respaldo (" + (ex.code || ex.message) + ")."; }
+    });
+  });
 }
 
 /* ---------- MI CUENTA ---------- */
