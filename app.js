@@ -39,6 +39,7 @@ let me = null;                 // perfil del usuario conectado {id, user, name, 
 let users = [], products = [], current = null; // current = id del turno abierto
 let session = null, sales = [], expenses = [], tabs = [];
 let pendingTab = null; // cuenta recién creada que aún no llega del servidor
+let tabLines = {}, lineUnsubs = {}; // líneas (productos anotados) de cada cuenta abierta
 let tab = "caja", cat = "Todas", cart = [], selTab = null; // selTab = cuenta (mesa/cliente) seleccionada; null = venta rápida
 let unsubs = [], sessUnsubs = [];
 const isAdmin = () => me && me.role === "admin";
@@ -114,7 +115,7 @@ async function onLoginSubmit(e) {
 }
 
 function stopListeners() { unsubs.forEach(u => u()); unsubs = []; stopSession(); }
-function stopSession() { sessUnsubs.forEach(u => u()); sessUnsubs = []; session = null; sales = []; expenses = []; tabs = []; selTab = null; pendingTab = null; }
+function stopSession() { sessUnsubs.forEach(u => u()); sessUnsubs = []; Object.values(lineUnsubs).forEach(u => u()); lineUnsubs = {}; tabLines = {}; session = null; sales = []; expenses = []; tabs = []; selTab = null; pendingTab = null; }
 
 async function onUser(fbUser) {
   stopListeners(); me = null; cart = [];
@@ -162,8 +163,8 @@ function watchSession(id) {
     tabs = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.openedAt.localeCompare(b.openedAt));
     if (pendingTab && tabs.some(x => x.id === pendingTab.id)) pendingTab = null;
     if (selTab && !tabs.some(x => x.id === selTab) && prev.some(x => x.id === selTab)) selTab = null;
-    renderNav();
-    if (tab === "caja" && $("#ticket") && !$("#modalRoot").firstChild) renderTicket(); else softRender();
+    syncLineListeners();
+    onTabsChanged();
   }));
 }
 
@@ -237,6 +238,7 @@ function viewCaja(v) {
   const cats = ["Todas", ...new Set(active.map(p => p.category).sort())];
   if (!cats.includes(cat)) cat = "Todas";
   const list = active.filter(p => cat === "Todas" || p.category === cat).sort((a, b) => a.name.localeCompare(b.name));
+  const withImg = active.some(p => p.img);
   v.innerHTML = `
   <div class="strip">
     <div class="panel status">
@@ -255,7 +257,7 @@ function viewCaja(v) {
       <div class="chips">${cats.map(c => `<button class="chip ${c === cat ? "on" : ""}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}</div>
       <div class="prods">${list.map(p => {
         const out = p.stock !== null && p.stock <= 0;
-        return `<button class="prod" data-add="${p.id}" ${out ? "disabled" : ""}><span class="pn">${esc(p.name)}</span>
+        return `<button class="prod${withImg ? " has-img" : ""}" data-add="${p.id}" ${out ? "disabled" : ""}>${withImg ? (p.img ? `<img class="pimg" src="${p.img}" alt="" loading="lazy">` : `<span class="pimg ph" aria-hidden="true">${esc(p.name.trim().charAt(0).toUpperCase())}</span>`) : ""}<span class="pn">${esc(p.name)}</span>
           ${p.stock !== null ? `<span class="ps ${p.stock <= 5 ? "low" : ""}">${out ? "Agotado" : p.stock + " en stock"}</span>` : ""}
           <span class="pp num">${fmt(p.price)}</span></button>`;
       }).join("") || `<div class="muted">No hay productos activos. ${isAdmin() ? "Agrégalos en Productos." : "Pide al administrador que los agregue."}</div>`}</div>
@@ -268,9 +270,44 @@ function viewCaja(v) {
   $("#closeBtn").onclick = closeModal;
   renderTicket();
 }
-/* ---------- cuentas por mesa / cliente ---------- */
+/* ---------- cuentas por mesa / cliente ----------
+   Cada producto anotado es un registro (línea) con hora y quién lo anotó:
+   sessions/{turno}/tabs/{cuenta}/lines/{línea}. Así varios meseros pueden anotar
+   a la vez sin chocar, y queda el desglose completo. */
 const curTab = () => (selTab ? tabs.find(t => t.id === selTab) || (pendingTab && pendingTab.id === selTab ? pendingTab : null) : null);
-const tabTotal = t => (t.items || []).reduce((a, l) => a + l.price * l.qty, 0);
+function tabLinesOf(t) {
+  const legacy = (t.items || []).map((l, i) => ({ id: "old" + i, ...l, at: t.openedAt, byName: t.openedByName }));
+  return legacy.concat(tabLines[t.id] || []);
+}
+function aggregate(lines) {
+  const map = new Map();
+  for (const l of lines) {
+    const k = l.pid || l.name;
+    const cur = map.get(k) || { pid: l.pid, name: l.name, price: l.price, qty: 0 };
+    cur.qty += l.qty; if (l.qty > 0) cur.price = l.price;
+    map.set(k, cur);
+  }
+  return [...map.values()].filter(x => x.qty > 0);
+}
+const tabTotal = t => aggregate(tabLinesOf(t)).reduce((a, l) => a + l.price * l.qty, 0);
+
+function syncLineListeners() {
+  const ids = new Set(tabs.map(t => t.id)); if (pendingTab) ids.add(pendingTab.id);
+  for (const id of Object.keys(lineUnsubs)) if (!ids.has(id)) { lineUnsubs[id](); delete lineUnsubs[id]; delete tabLines[id]; }
+  for (const id of ids) if (!lineUnsubs[id]) {
+    const sid = current;
+    lineUnsubs[id] = onSnapshot(query(collection(db, "sessions", sid, "tabs", id, "lines"), orderBy("at")), s => {
+      tabLines[id] = s.docs.map(d => ({ id: d.id, ...d.data() }));
+      onTabsChanged();
+    }, e => console.error(e));
+  }
+}
+function onTabsChanged() {
+  renderNav();
+  const box = $("#modalRoot .modal[data-detail]");
+  if (box) { renderDetail(box); return; }
+  if (tab === "caja" && $("#ticket") && !$("#modalRoot").firstChild) renderTicket(); else softRender();
+}
 
 function addToCart(pid) {
   const p = products.find(x => x.id === pid); if (!p) return;
@@ -286,49 +323,26 @@ function changeCart(pid, delta) {
   cart[i].qty--; if (cart[i].qty <= 0) cart.splice(i, 1); renderTicket();
 }
 
-// Agrega o retira productos de una cuenta abierta. Usa transacción para que dos meseros no se pisen.
-async function changeTab(tid, pid, delta) {
+// Anota (+) o retira (−) un producto en una cuenta abierta.
+function changeTab(tid, pid, delta) {
+  const t = curTab() && curTab().id === tid ? curTab() : tabs.find(x => x.id === tid);
+  if (!t) { toast("Esa cuenta ya fue cobrada"); return; }
   const p = products.find(x => x.id === pid);
-  const sid = current;
-  try {
-    await runTransaction(db, async tx => {
-      const ref = doc(db, "sessions", sid, "tabs", tid);
-      const pref = doc(db, "products", pid);
-      const s = await tx.get(ref);
-      const ps = p && p.stock !== null ? await tx.get(pref) : null;
-      if (!s.exists() && pendingTab && pendingTab.id === tid) throw { code: "tab-pending" };
-      if (!s.exists() || s.data().status !== "open") throw { code: "tab-closed" };
-      const data = s.data(), items = [...(data.items || [])];
-      const i = items.findIndex(l => l.pid === pid);
-      const tracked = ps && ps.exists() && ps.data().stock !== null;
-      if (delta > 0) {
-        if (!p) throw { code: "no-product" };
-        if (tracked && ps.data().stock < delta) throw { code: "no-stock" };
-        if (i >= 0) items[i] = { ...items[i], qty: items[i].qty + delta };
-        else items.push({ pid, name: p.name, price: p.price, qty: delta });
-        tx.update(ref, { items, updatedAt: nowIso() });
-      } else {
-        if (i < 0) return;
-        const log = [...(data.log || []), { name: items[i].name, qty: -delta, by: me.name, at: nowIso() }];
-        const nq = items[i].qty + delta;
-        if (nq <= 0) items.splice(i, 1); else items[i] = { ...items[i], qty: nq };
-        tx.update(ref, { items, log, updatedAt: nowIso() });
-      }
-      if (tracked) tx.update(pref, { stock: increment(-delta) });
-    });
-  } catch (e) {
-    if (e.code === "no-stock") toast("No hay más unidades de " + (p ? p.name : "este producto"));
-    else if (e.code === "tab-closed") toast("Esa cuenta ya fue cobrada");
-    else if (e.code === "tab-pending") toast("La cuenta se está creando, intenta de nuevo en un segundo.");
-    else if (e.code === "unavailable" || e.code === "failed-precondition") toast("Sin conexión: no se pudo anotar en la cuenta.");
-    else fail(e);
-  }
+  const inTab = aggregate(tabLinesOf(t)).find(x => x.pid === pid);
+  if (delta < 0 && (!inTab || inTab.qty < -delta)) return;
+  if (delta > 0 && !p) { toast("Ese producto ya no existe"); return; }
+  if (delta > 0 && p.stock !== null && p.stock < delta) { toast("No hay más unidades de " + p.name); return; }
+  const line = { pid, name: (p && p.name) || inTab.name, price: delta > 0 ? p.price : inTab.price, qty: delta, at: nowIso(), by: me.id, byName: me.name };
+  const b = writeBatch(db);
+  b.set(doc(collection(db, "sessions", current, "tabs", tid, "lines")), line);
+  if (p && p.stock !== null) b.update(doc(db, "products", pid), { stock: increment(-delta) });
+  b.commit().catch(e => fail(e, "No se pudo anotar en la cuenta. Revisa la conexión."));
 }
 
 function renderTicket() {
   const el = $("#ticket"); if (!el) return;
   const t = curTab(); if (selTab && !t) selTab = null;
-  const lines = t ? (t.items || []) : cart;
+  const lines = t ? aggregate(tabLinesOf(t)) : cart;
   const total = lines.reduce((a, l) => a + l.price * l.qty, 0);
   el.innerHTML = `
   <div class="accbar" role="tablist" aria-label="Cuentas">
@@ -336,23 +350,24 @@ function renderTicket() {
     ${tabs.map(x => `<button class="acc ${selTab === x.id ? "on" : ""}" data-acc="${x.id}">${esc(x.label)}<small>${fmt(tabTotal(x))}</small></button>`).join("")}
     <button class="acc add" id="newTab">+ Cuenta</button>
   </div>
-  <div class="ticket-h"><div><h3>${t ? esc(t.label) : "Venta rápida"}</h3><div class="meta">${t ? `Abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}${t.note ? " · " + esc(t.note) : ""}` : "Se cobra en el momento"}</div></div>
-    ${!t && cart.length ? `<button class="btn btn-ghost btn-sm" id="clr">Vaciar</button>` : ""}</div>
+  <div class="ticket-h"><div style="min-width:0"><h3>${t ? esc(t.label) : "Venta rápida"}</h3><div class="meta">${t ? `Abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}${t.note ? " · " + esc(t.note) : ""}` : "Se cobra en el momento"}</div></div>
+    ${t ? `<button class="btn btn-sm" id="detBtn">Desglose</button>` : (cart.length ? `<button class="btn btn-ghost btn-sm" id="clr">Vaciar</button>` : "")}</div>
   <div class="lines">${lines.length ? lines.map(l => `<div class="line"><div class="ln">${esc(l.name)}<div class="lu num">${fmt(l.price)} c/u</div></div>
     <div class="qty"><button data-dec="${l.pid}" aria-label="Quitar uno">−</button><span class="num">${l.qty}</span><button data-inc="${l.pid}" aria-label="Agregar uno">+</button></div>
     <div class="lt num">${fmt(l.price * l.qty)}</div></div>`).join("")
     : `<div class="empty">${t ? "Toca los productos para anotarlos en esta cuenta." : "Toca un producto para agregarlo."}</div>`}</div>
   <div class="ticket-f">
     <div class="total"><span class="label">${t ? "Consumo" : "Total"}</span><span class="v num gold-text">${fmt(total)}</span></div>
-    ${t ? `<div class="note">Lo que se toque queda anotado en ${esc(t.label)}. Se cobra cuando el cliente se va.</div>` : ""}
+    ${t ? `<div class="note">Lo que se toque queda anotado en ${esc(t.label)} con la hora. Se cobra cuando el cliente se va.</div>` : ""}
     <button class="btn btn-gold btn-lg" id="pay" ${lines.length ? "" : "disabled"}>${t ? "Cobrar cuenta" : "Cobrar"} ${lines.length ? fmt(total) : ""}</button>
   </div>`;
   el.querySelectorAll("[data-acc]").forEach(b => b.onclick = () => { selTab = b.dataset.acc || null; renderTicket(); });
   el.querySelector("#newTab").onclick = newTabModal;
   el.querySelector("#clr")?.addEventListener("click", () => { cart = []; renderTicket(); });
+  el.querySelector("#detBtn")?.addEventListener("click", () => detailModal(t.id));
   el.querySelectorAll("[data-inc]").forEach(b => b.onclick = () => t ? changeTab(t.id, b.dataset.inc, 1) : changeCart(b.dataset.inc, 1));
   el.querySelectorAll("[data-dec]").forEach(b => b.onclick = () => t ? changeTab(t.id, b.dataset.dec, -1) : changeCart(b.dataset.dec, -1));
-  el.querySelector("#pay").onclick = () => t ? payModal(t) : payModal(null);
+  el.querySelector("#pay").onclick = () => payModal(t);
 }
 
 function newTabModal() {
@@ -376,8 +391,9 @@ function newTabModal() {
       const label = kind === "Mesa" && !/^mesa\b/i.test(v) ? "Mesa " + v : v;
       if (tabs.some(x => x.label.toLowerCase() === label.toLowerCase())) { m.querySelector("#terr").textContent = `Ya hay una cuenta abierta para ${label}.`; return; }
       const ref = doc(collection(db, "sessions", current, "tabs"));
-      const data = { label, kind, note: m.querySelector("#tn").value.trim(), items: [], log: [], status: "open", openedAt: nowIso(), openedBy: me.id, openedByName: me.name };
+      const data = { label, kind, note: m.querySelector("#tn").value.trim(), status: "open", openedAt: nowIso(), openedBy: me.id, openedByName: me.name };
       pendingTab = { id: ref.id, ...data };
+      syncLineListeners();
       setDoc(ref, data).catch(e => { pendingTab = null; fail(e); });
       selTab = ref.id; tab = "caja"; close(); toast("Cuenta abierta: " + label); render();
     };
@@ -386,25 +402,60 @@ function newTabModal() {
   });
 }
 
-/* ---------- capture de transferencia ---------- */
+/* ---------- desglose de una cuenta ---------- */
+function detailModal(tid) {
+  modal(`<div data-body></div>`, (m, close) => { m.dataset.detail = tid; m._close = close; renderDetail(m); });
+}
+function renderDetail(m) {
+  const tid = m.dataset.detail;
+  const t = tabs.find(x => x.id === tid) || (pendingTab && pendingTab.id === tid ? pendingTab : null);
+  const body = m.querySelector("[data-body]");
+  if (!t) { body.innerHTML = `<h3>Cuenta cobrada</h3><p class="muted">Esta cuenta ya fue cobrada.</p><div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`; body.querySelector("[data-x]").onclick = m._close; return; }
+  const lines = tabLinesOf(t), agg = aggregate(lines), total = agg.reduce((a, l) => a + l.price * l.qty, 0);
+  body.innerHTML = `<div class="sec" style="gap:14px">
+    <div><div class="label">Desglose · abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}</div><h3 style="margin-top:4px;font-size:1.3rem">${esc(t.label)}</h3>${t.note ? `<div class="muted small">${esc(t.note)}</div>` : ""}</div>
+    <div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Producto</th><th class="r">Cant.</th><th class="r">Valor</th><th>Anotó</th></tr></thead><tbody>
+    ${lines.length ? lines.map(l => `<tr${l.qty < 0 ? ' class="minus"' : ""}><td class="num">${tm(l.at)}</td><td>${esc(l.name)}${l.qty < 0 ? ' <span class="pill bad">Retirado</span>' : ""}</td><td class="r num">${l.qty > 0 ? "+" : "−"}${Math.abs(l.qty)}</td><td class="r num">${l.qty < 0 ? "−" : ""}${fmt(Math.abs(l.qty) * l.price)}</td><td class="muted">${esc(l.byName || "")}</td></tr>`).join("")
+      : `<tr><td colspan="5" class="empty">Todavía no hay productos anotados.</td></tr>`}
+    </tbody></table></div>
+    ${agg.length ? `<div><div class="label" style="margin-bottom:4px">Resumen</div><div class="sum num">${agg.map(l => `<div><span>${l.qty}× ${esc(l.name)}</span><span>${fmt(l.qty * l.price)}</span></div>`).join("")}</div></div>` : ""}
+    <div class="total"><span class="label">Total de la cuenta</span><span class="v num gold-text">${fmt(total)}</span></div>
+    <div class="modal-f"><button class="btn btn-ghost" data-x>Cerrar</button><button class="btn" data-add>Agregar productos</button><button class="btn btn-gold" data-pay ${agg.length ? "" : "disabled"}>Cobrar ${fmt(total)}</button></div>
+  </div>`;
+  body.querySelector("[data-x]").onclick = m._close;
+  body.querySelector("[data-add]").onclick = () => { m._close(); selTab = tid; tab = "caja"; render(); };
+  body.querySelector("[data-pay]").onclick = () => { m._close(); payModal(t); };
+}
+
+/* ---------- imágenes (capture de transferencia y foto de producto) ---------- */
 // Se reduce la imagen en el navegador y se guarda en Firestore (sin necesidad de Firebase Storage ni plan de pago).
-async function compressImage(file) {
+async function compressImage(file, steps = [[1100, 0.7], [900, 0.6], [700, 0.5], [550, 0.45]], maxLen = 700000) {
   const url = URL.createObjectURL(file);
   try {
     const img = await new Promise((ok, ko) => { const i = new Image(); i.onload = () => ok(i); i.onerror = ko; i.src = url; });
-    for (const [max, q] of [[1100, 0.7], [900, 0.6], [700, 0.5], [550, 0.45]]) {
+    for (const [max, q] of steps) {
       const k = Math.min(1, max / Math.max(img.width, img.height));
       const c = document.createElement("canvas"); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
       const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
       const data = c.toDataURL("image/jpeg", q);
-      if (data.length < 700000) return data;
+      if (data.length < maxLen) return data;
     }
     throw new Error("too-big");
   } finally { URL.revokeObjectURL(url); }
 }
+// Dos botones: tomar foto con la cámara (en celular) o elegir una imagen guardada.
+function photoPicker(id) {
+  return `<div class="pick">
+    <label class="btn btn-sm" for="${id}Cam">Tomar foto</label><input type="file" id="${id}Cam" accept="image/*" capture="environment" hidden>
+    <label class="btn btn-sm" for="${id}Gal">Elegir imagen</label><input type="file" id="${id}Gal" accept="image/*" hidden>
+  </div>`;
+}
+function bindPicker(root, id, onFile) {
+  for (const s of ["Cam", "Gal"]) root.querySelector("#" + id + s).addEventListener("change", e => { const f = e.target.files[0]; e.target.value = ""; if (f) onFile(f); });
+}
 
 function payModal(t) {
-  const lines = t ? (t.items || []) : cart.map(l => ({ ...l }));
+  const lines = t ? aggregate(tabLinesOf(t)) : cart.map(l => ({ ...l }));
   const total = lines.reduce((a, l) => a + l.price * l.qty, 0);
   let m = "efectivo", img = null;
   modal(`<h3>${t ? "Cobrar " + esc(t.label) : "Cobrar venta"}</h3>
@@ -416,8 +467,8 @@ function payModal(t) {
     <div class="change"><span class="muted">Cambio</span><b class="num" id="chg">—</b></div>
   </div>
   <div id="trBox" class="sec" style="gap:10px" hidden>
-    <label class="drop" for="cap"><input type="file" id="cap" accept="image/*" hidden><span id="capTxt">Adjuntar capture de la transferencia</span><img id="capPrev" alt="Capture de la transferencia" hidden></label>
-    <div class="muted small" style="text-align:center">Toca para elegir la foto, o pega la imagen con Ctrl+V.</div>
+    <div class="drop" id="capBox"><span id="capTxt">Adjunta el capture de la transferencia</span><img id="capPrev" alt="Capture de la transferencia" hidden>${photoPicker("cap")}</div>
+    <div class="muted small" style="text-align:center">En el computador también puedes pegar la imagen con Ctrl+V.</div>
     <div class="field"><label class="label" for="ref">Referencia o comprobante (opcional)</label><input class="input" id="ref" placeholder="Ej: M123456"></div>
   </div>
   <div class="err" id="perr"></div>
@@ -434,10 +485,10 @@ function payModal(t) {
       try {
         img = await compressImage(f);
         const p = box.querySelector("#capPrev"); p.src = img; p.hidden = false;
-        box.querySelector("#capTxt").textContent = "Capture adjunto · toca para cambiarlo"; err.textContent = "";
-      } catch (e) { img = null; box.querySelector("#capTxt").textContent = "Adjuntar capture de la transferencia"; err.textContent = "No se pudo leer la imagen. Prueba con otra captura."; }
+        box.querySelector("#capTxt").textContent = "Capture adjunto. Puedes cambiarlo:"; err.textContent = "";
+      } catch (e) { img = null; box.querySelector("#capTxt").textContent = "Adjunta el capture de la transferencia"; err.textContent = "No se pudo leer la imagen. Prueba con otra foto."; }
     };
-    box.querySelector("#cap").addEventListener("change", e => setFile(e.target.files[0]));
+    bindPicker(box, "cap", setFile);
     const onPaste = e => {
       if (!box.isConnected) { window.removeEventListener("paste", onPaste); return; }
       const it = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
@@ -455,15 +506,19 @@ function payModal(t) {
           const rcptRef = m === "transfer" && img ? doc(collection(db, "receipts")) : null;
           const base = { at: nowIso(), by: me.id, byName: me.name, method: m, voided: false, receiptId: rcptRef ? rcptRef.id : null, reference };
           if (t) {
+            const fresh = tabs.find(x => x.id === t.id);
+            if (!fresh) throw { code: "tab-closed" };
+            const allLines = tabLinesOf(fresh), items = aggregate(allLines);
+            const tot = items.reduce((a, l) => a + l.price * l.qty, 0);
+            if (tot !== total) throw { code: "tab-changed" };
             await runTransaction(db, async tx => {
               const tref = doc(db, "sessions", sid, "tabs", t.id);
               const s = await tx.get(tref);
               if (!s.exists() || s.data().status !== "open") throw { code: "tab-closed" };
-              const d = s.data(), items = d.items || [], tot = items.reduce((a, l) => a + l.price * l.qty, 0);
-              if (tot !== total) throw { code: "tab-changed" };
               if (rcptRef) tx.set(rcptRef, { img, at: nowIso(), by: me.id, session: sid, total: tot });
-              tx.set(saleRef, { ...base, items, total: tot, account: d.label, tabId: t.id, tabOpenedAt: d.openedAt, removed: d.log || [] });
-              tx.update(tref, { status: "paid", paidAt: nowIso(), paidBy: me.name, saleId: saleRef.id });
+              tx.set(saleRef, { ...base, items, total: tot, account: fresh.label, tabId: t.id, tabOpenedAt: fresh.openedAt,
+                lines: allLines.map(l => ({ name: l.name, qty: l.qty, price: l.price, at: l.at, byName: l.byName || "" })) });
+              tx.update(tref, { status: "paid", paidAt: nowIso(), paidBy: me.name, saleId: saleRef.id, total: tot });
             });
             selTab = null;
           } else {
@@ -479,7 +534,7 @@ function payModal(t) {
         } catch (ex) {
           if (ex.code === "tab-changed") { err.textContent = "Alguien agregó o quitó productos de esta cuenta. Cierra y revisa el nuevo total."; }
           else if (ex.code === "tab-closed") { close(); toast("Esa cuenta ya fue cobrada"); }
-          else if (ex.code === "unavailable" || ex.code === "failed-precondition") err.textContent = "Sin conexión: las cuentas solo se pueden cobrar con internet.";
+          else if (ex.code === "unavailable" || ex.code === "failed-precondition") err.textContent = "No se pudo confirmar con el servidor. Revisa la conexión e intenta de nuevo.";
           else { console.error(ex); err.textContent = "No se pudo registrar el pago (" + (ex.code || ex.message) + ")."; }
         }
       });
@@ -496,19 +551,37 @@ async function receiptModal(id) {
   } catch (e) { fail(e, "No se pudo cargar el capture."); close(); }
 }
 
+// Desglose de una venta ya cobrada (desde Movimientos).
+function saleDetailModal(x) {
+  const lines = x.lines || [];
+  modal(`<div class="label">${esc(METHODS[x.method] || x.method)} · cobrada ${tm(x.at)} por ${esc(x.byName)}</div><h3 style="font-size:1.3rem">${esc(x.account || "Venta rápida")}</h3>
+  ${lines.length ? `<div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Producto</th><th class="r">Cant.</th><th>Anotó</th></tr></thead><tbody>
+    ${lines.map(l => `<tr><td class="num">${tm(l.at)}</td><td>${esc(l.name)}${l.qty < 0 ? ' <span class="pill bad">Retirado</span>' : ""}</td><td class="r num">${l.qty > 0 ? "+" : "−"}${Math.abs(l.qty)}</td><td class="muted">${esc(l.byName || "")}</td></tr>`).join("")}
+  </tbody></table></div>` : ""}
+  <div class="sum num">${x.items.map(i => `<div><span>${i.qty}× ${esc(i.name)}</span><span>${fmt(i.qty * i.price)}</span></div>`).join("")}</div>
+  <div class="total"><span class="label">Total</span><span class="v num gold-text">${fmt(x.total)}</span></div>
+  <div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; });
+}
+
 /* ---------- vista de cuentas abiertas ---------- */
 function viewCuentas(v) {
   if (!current || !session) { v.innerHTML = `<div class="panel pad empty">La caja está cerrada. Abre la caja para llevar cuentas por mesa o cliente.</div>`; return; }
   const sum = tabs.reduce((a, x) => a + tabTotal(x), 0);
   v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${tabs.length} cuentas abiertas · ${fmt(sum)} por cobrar</div><h2>Cuentas por mesa y cliente</h2></div><button class="btn btn-gold" id="newTab2">Nueva cuenta</button></div>
-  ${tabs.length ? `<div class="cards">${tabs.map(x => `<div class="panel card">
-    <div class="ct"><h3>${esc(x.label)}</h3><span class="muted small">${tm(x.openedAt)}</span></div>
-    ${x.note ? `<div class="muted small">${esc(x.note)}</div>` : ""}
-    <div class="items">${(x.items || []).length ? x.items.map(l => `${l.qty}× ${esc(l.name)}`).join(", ") : "Sin consumo todavía"}</div>
-    <div class="amt num">${fmt(tabTotal(x))}</div>
-    <div class="row"><button class="btn btn-sm" data-open="${x.id}">Agregar productos</button><button class="btn btn-gold btn-sm" data-pay="${x.id}" ${(x.items || []).length ? "" : "disabled"}>Cobrar</button></div>
-  </div>`).join("")}</div>` : `<div class="panel pad empty">No hay cuentas abiertas. Crea una cuando llegue una mesa o un cliente que paga al final.</div>`}</div>`;
+  ${tabs.length ? `<div class="cards">${tabs.map(x => {
+    const agg = aggregate(tabLinesOf(x)), last = (tabLines[x.id] || []).slice(-1)[0];
+    return `<div class="panel card">
+    <button class="card-hit" data-det="${x.id}" aria-label="Ver desglose de ${esc(x.label)}">
+      <div class="ct"><h3>${esc(x.label)}</h3><span class="muted small">${tm(x.openedAt)}</span></div>
+      ${x.note ? `<div class="muted small">${esc(x.note)}</div>` : ""}
+      <div class="items">${agg.length ? agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ") : "Sin consumo todavía"}</div>
+      <div class="amt num">${fmt(agg.reduce((a, l) => a + l.price * l.qty, 0))}</div>
+      <div class="muted small">${last ? "Último pedido " + tm(last.at) + " · " : ""}Toca para ver el desglose</div>
+    </button>
+    <div class="row"><button class="btn btn-sm" data-open="${x.id}">Agregar productos</button><button class="btn btn-gold btn-sm" data-pay="${x.id}" ${agg.length ? "" : "disabled"}>Cobrar</button></div>
+  </div>`; }).join("")}</div>` : `<div class="panel pad empty">No hay cuentas abiertas. Crea una cuando llegue una mesa o un cliente que paga al final.</div>`}</div>`;
   $("#newTab2").onclick = newTabModal;
+  v.querySelectorAll("[data-det]").forEach(b => b.onclick = () => detailModal(b.dataset.det));
   v.querySelectorAll("[data-open]").forEach(b => b.onclick = () => { selTab = b.dataset.open; tab = "caja"; render(); });
   v.querySelectorAll("[data-pay]").forEach(b => b.onclick = () => payModal(tabs.find(x => x.id === b.dataset.pay)));
 }
@@ -615,19 +688,21 @@ function reportModal(s) {
 }
 
 /* ---------- MOVIMIENTOS ---------- */
+const removedOf = x => (x.removed && x.removed.length) ? x.removed : (x.lines || []).filter(l => l.qty < 0).map(l => ({ qty: -l.qty, name: l.name, by: l.byName }));
 function viewMov(v) {
   if (!current || !session) { v.innerHTML = `<div class="panel pad empty">No hay un turno abierto. Abre la caja para ver los movimientos del turno.</div>`; return; }
   const list = [...sales].reverse();
   v.innerHTML = `<div class="sec">
     <div class="sec-h"><div><div class="label">Turno abierto ${dt(session.openedAt)}</div><h2>Movimientos del turno</h2></div></div>
     <div class="panel"><div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Cuenta</th><th>Productos</th><th>Pago</th><th>Cobró</th><th class="r">Total</th>${isAdmin() ? "<th></th>" : ""}</tr></thead><tbody>
-    ${list.map(x => `<tr class="${x.voided ? "voided" : ""}"><td class="num">${tm(x.at)}</td><td>${x.account ? esc(x.account) : '<span class="muted">Venta rápida</span>'}</td><td class="items">${x.items.map(i => `${i.qty}× ${esc(i.name)}`).join(", ")}${x.removed && x.removed.length ? `<div class="muted small" title="${esc(x.removed.map(r => r.qty + "× " + r.name + " (" + r.by + ")").join(", "))}">${x.removed.length} retiro(s) de productos</div>` : ""}</td><td>${METHODS[x.method] || x.method}${x.voided ? ` <span class="pill void">Anulada</span>` : ""}${x.method === "transfer" ? (x.receiptId ? `<div><button class="link small" data-rcpt="${x.receiptId}">Ver capture</button></div>` : `<div class="muted small">Sin capture</div>`) : ""}${x.reference ? `<div class="muted small">Ref. ${esc(x.reference)}</div>` : ""}</td><td>${esc(x.byName)}</td><td class="r num">${fmt(x.total)}</td>${isAdmin() ? `<td class="r">${x.voided ? "" : `<button class="btn btn-danger btn-sm" data-void="${x.id}">Anular</button>`}</td>` : ""}</tr>`).join("") || `<tr><td colspan="7" class="empty">Aún no hay ventas en este turno.</td></tr>`}
+    ${list.map(x => `<tr class="${x.voided ? "voided" : ""}"><td class="num">${tm(x.at)}</td><td>${x.account ? `<button class="link" data-sale="${x.id}">${esc(x.account)}</button>` : '<span class="muted">Venta rápida</span>'}</td><td class="items">${x.items.map(i => `${i.qty}× ${esc(i.name)}`).join(", ")}${removedOf(x).length ? `<div class="muted small" title="${esc(removedOf(x).map(r => r.qty + "× " + r.name + " (" + r.by + ")").join(", "))}">${removedOf(x).length} retiro(s) de productos</div>` : ""}</td><td>${METHODS[x.method] || x.method}${x.voided ? ` <span class="pill void">Anulada</span>` : ""}${x.method === "transfer" ? (x.receiptId ? `<div><button class="link small" data-rcpt="${x.receiptId}">Ver capture</button></div>` : `<div class="muted small">Sin capture</div>`) : ""}${x.reference ? `<div class="muted small">Ref. ${esc(x.reference)}</div>` : ""}</td><td>${esc(x.byName)}</td><td class="r num">${fmt(x.total)}</td>${isAdmin() ? `<td class="r">${x.voided ? "" : `<button class="btn btn-danger btn-sm" data-void="${x.id}">Anular</button>`}</td>` : ""}</tr>`).join("") || `<tr><td colspan="7" class="empty">Aún no hay ventas en este turno.</td></tr>`}
     </tbody></table></div></div>
     <h3>Salidas de efectivo</h3>
     <div class="panel"><div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Concepto</th><th>Registró</th><th class="r">Valor</th></tr></thead><tbody>
     ${expenses.slice().reverse().map(x => `<tr><td class="num">${tm(x.at)}</td><td>${esc(x.concept)}</td><td>${esc(x.byName)}</td><td class="r num">${fmt(x.amount)}</td></tr>`).join("") || `<tr><td colspan="4" class="empty">Sin salidas registradas.</td></tr>`}
     </tbody></table></div></div></div>`;
   v.querySelectorAll("[data-rcpt]").forEach(b => b.onclick = () => receiptModal(b.dataset.rcpt));
+  v.querySelectorAll("[data-sale]").forEach(b => b.onclick = () => saleDetailModal(sales.find(y => y.id === b.dataset.sale)));
   v.querySelectorAll("[data-void]").forEach(b => b.onclick = () => {
     const x = sales.find(y => y.id === b.dataset.void);
     confirmBox("Anular venta", `La venta de ${fmt(x.total)} (${tm(x.at)}) dejará de contar en el cierre y las unidades vuelven al inventario.`, "Anular venta", true, async () => {
@@ -655,7 +730,7 @@ function viewProd(v) {
   const ps = [...products].sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
   v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${ps.length} productos</div><h2>Productos</h2></div><button class="btn btn-gold" id="newP">Agregar producto</button></div>
   ${ps.length ? `<div class="panel"><div class="tbl-wrap"><table><thead><tr><th>Producto</th><th>Categoría</th><th class="r">Precio</th><th class="r">Stock</th><th>Estado</th><th></th></tr></thead><tbody>
-  ${ps.map(p => `<tr><td><b>${esc(p.name)}</b></td><td>${esc(p.category)}</td><td class="r num">${fmt(p.price)}</td><td class="r num">${p.stock === null ? '<span class="muted">Sin control</span>' : (p.stock <= 5 ? `<span style="color:var(--warn)">${p.stock}</span>` : p.stock)}</td>
+  ${ps.map(p => `<tr><td><div class="pcell">${p.img ? `<img class="thumb" src="${p.img}" alt="">` : `<span class="thumb ph">${esc(p.name.trim().charAt(0).toUpperCase())}</span>`}<b>${esc(p.name)}</b></div></td><td>${esc(p.category)}</td><td class="r num">${fmt(p.price)}</td><td class="r num">${p.stock === null ? '<span class="muted">Sin control</span>' : (p.stock <= 5 ? `<span style="color:var(--warn)">${p.stock}</span>` : p.stock)}</td>
   <td>${p.active ? '<span class="pill ok">Activo</span>' : '<span class="pill void">Oculto</span>'}</td><td><div class="actions"><button class="btn btn-sm" data-edit="${p.id}">Editar</button></div></td></tr>`).join("")}
   </tbody></table></div></div>` : `<div class="panel pad sec"><h3>Aún no hay productos</h3><p class="muted" style="margin:0">Agrega tus productos uno por uno, o carga una lista de ejemplo de discoteca (cervezas, licores, cover) y luego ajusta precios y stock.</p><div><button class="btn" id="seedP">Cargar lista de ejemplo</button></div></div>`}</div>`;
   $("#newP").onclick = () => prodModal(null);
@@ -668,6 +743,8 @@ function viewProd(v) {
 function prodModal(p) {
   const cats = [...new Set(products.map(x => x.category))];
   modal(`<h3>${p ? "Editar producto" : "Nuevo producto"}</h3>
+  <div class="pimg-edit"><div class="pimg-prev" id="pimgPrev">${p && p.img ? `<img src="${p.img}" alt="">` : `<span>Sin imagen</span>`}</div>
+    <div class="sec" style="gap:8px"><span class="label">Imagen del producto</span>${photoPicker("pimg")}<button class="link small" id="pimgDel" ${p && p.img ? "" : "hidden"} style="align-self:flex-start">Quitar imagen</button></div></div>
   <div class="field"><label class="label" for="pn">Nombre</label><input class="input" id="pn" value="${esc(p?.name)}"></div>
   <div class="row"><div class="field"><label class="label" for="pc">Categoría</label><input class="input" id="pc" list="catlist" value="${esc(p?.category)}"><datalist id="catlist">${cats.map(c => `<option value="${esc(c)}">`).join("")}</datalist></div>
   <div class="field"><label class="label" for="pp">Precio</label><input class="input num" id="pp" inputmode="numeric" value="${p ? fmt(p.price) : ""}"></div></div>
@@ -676,12 +753,21 @@ function prodModal(p) {
   <div class="err" id="perr"></div>
   <div class="modal-f">${p ? `<button class="btn btn-danger" data-del style="margin-right:auto">Eliminar</button>` : ""}<button class="btn btn-ghost" data-x>Cancelar</button><button class="btn btn-gold" data-ok>Guardar</button></div>`, (m, close) => {
     const pr = m.querySelector("#pp"); moneyInput(pr);
+    let pimg = p ? (p.img || null) : null;
+    const prev = m.querySelector("#pimgPrev"), del = m.querySelector("#pimgDel");
+    bindPicker(m, "pimg", async f => {
+      if (!f.type.startsWith("image/")) { m.querySelector("#perr").textContent = "El archivo debe ser una imagen."; return; }
+      prev.innerHTML = "<span>Procesando…</span>";
+      try { pimg = await compressImage(f, [[360, 0.75], [300, 0.68], [240, 0.6]], 120000); prev.innerHTML = `<img src="${pimg}" alt="">`; del.hidden = false; m.querySelector("#perr").textContent = ""; }
+      catch (e) { prev.innerHTML = pimg ? `<img src="${pimg}" alt="">` : "<span>Sin imagen</span>"; m.querySelector("#perr").textContent = "No se pudo leer la imagen. Prueba con otra foto."; }
+    });
+    del.onclick = () => { pimg = null; prev.innerHTML = "<span>Sin imagen</span>"; del.hidden = true; };
     m.querySelector("[data-x]").onclick = close;
     m.querySelector("[data-del]")?.addEventListener("click", () => { close(); confirmBox("Eliminar producto", `¿Eliminar “${esc(p.name)}”? Las ventas ya registradas no cambian. Si solo quieres dejar de venderlo, márcalo como oculto.`, "Eliminar", true, () => deleteDoc(doc(db, "products", p.id)).then(() => toast("Producto eliminado"), e => fail(e))); });
     m.querySelector("[data-ok]").onclick = () => {
       const name = m.querySelector("#pn").value.trim(), category = m.querySelector("#pc").value.trim() || "General", price = parseMoney(pr.value), sv = m.querySelector("#ps").value.trim();
       if (!name || !price) { m.querySelector("#perr").textContent = "El producto necesita nombre y precio."; return; }
-      const data = { name, category, price, stock: sv === "" ? null : (parseInt(sv, 10) || 0), active: m.querySelector("#pa").value === "1" };
+      const data = { name, category, price, stock: sv === "" ? null : (parseInt(sv, 10) || 0), active: m.querySelector("#pa").value === "1", img: pimg };
       (p ? updateDoc(doc(db, "products", p.id), data) : addDoc(collection(db, "products"), data)).catch(e => fail(e));
       close(); toast(p ? "Producto actualizado" : "Producto agregado");
     };

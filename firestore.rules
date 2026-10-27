@@ -56,6 +56,11 @@ service cloud.firestore {
       match /tabs/{tabId} {
         allow read, create, update: if isActive();
         allow delete: if false;
+        // Cada producto anotado en la cuenta, con hora y quién lo anotó.
+        match /lines/{lineId} {
+          allow read, create: if isActive();
+          allow update, delete: if false;
+        }
       }
     }
 
