@@ -309,64 +309,133 @@ function onTabsChanged() {
   if (tab === "caja" && $("#ticket") && !$("#modalRoot").firstChild) renderTicket(); else softRender();
 }
 
-function addToCart(pid) {
-  const p = products.find(x => x.id === pid); if (!p) return;
-  if (selTab) { changeTab(selTab, pid, 1); return; }
-  const l = cart.find(x => x.pid === pid); const q = (l ? l.qty : 0) + 1;
-  if (p.stock !== null && q > p.stock) { toast("No hay más unidades de " + p.name); return; }
-  if (l) l.qty = q; else cart.push({ pid, name: p.name, price: p.price, qty: 1 });
-  renderTicket();
-}
-function changeCart(pid, delta) {
-  if (delta > 0) return addToCart(pid);
-  const i = cart.findIndex(l => l.pid === pid); if (i < 0) return;
-  cart[i].qty--; if (cart[i].qty <= 0) cart.splice(i, 1); renderTicket();
+/* Pedido en curso de cada cuenta: se arma tocando productos y se guarda con el botón "Agregar pedido".
+   Cada pedido queda con su hora; así se ve cuándo pidió cada mesa o cliente. */
+const drafts = {}; // id de cuenta -> [{pid, name, price, qty}]
+const draftOf = tid => (drafts[tid] = drafts[tid] || []);
+const sumLines = ls => ls.reduce((a, l) => a + l.price * l.qty, 0);
+
+// Agrupa las líneas de una cuenta por pedido (mismo orderId), en orden de hora.
+function ordersOf(t) {
+  const groups = new Map();
+  if ((t.items || []).length) groups.set("legacy", { id: "legacy", at: t.openedAt, byName: t.openedByName, lines: t.items.map(l => ({ ...l, at: t.openedAt })) });
+  for (const l of tabLines[t.id] || []) {
+    const k = l.orderId || l.id;
+    if (!groups.has(k)) groups.set(k, { id: k, at: l.at, byName: l.byName, lines: [] });
+    groups.get(k).lines.push(l);
+  }
+  const list = [...groups.values()];
+  // Las líneas retiradas (qty < 0) se muestran dentro del pedido al que pertenecen.
+  return list.filter(g => g.lines.some(l => l.qty > 0)).concat(list.filter(g => !g.lines.some(l => l.qty > 0) && g.lines.length).map(g => ({ ...g, onlyRemovals: true })))
+    .sort((a, b) => a.at.localeCompare(b.at));
 }
 
-// Anota (+) o retira (−) un producto en una cuenta abierta.
-function changeTab(tid, pid, delta) {
-  const t = curTab() && curTab().id === tid ? curTab() : tabs.find(x => x.id === tid);
-  if (!t) { toast("Esa cuenta ya fue cobrada"); return; }
-  const p = products.find(x => x.id === pid);
-  const inTab = aggregate(tabLinesOf(t)).find(x => x.pid === pid);
-  if (delta < 0 && (!inTab || inTab.qty < -delta)) return;
-  if (delta > 0 && !p) { toast("Ese producto ya no existe"); return; }
-  if (delta > 0 && p.stock !== null && p.stock < delta) { toast("No hay más unidades de " + p.name); return; }
-  const line = { pid, name: (p && p.name) || inTab.name, price: delta > 0 ? p.price : inTab.price, qty: delta, at: nowIso(), by: me.id, byName: me.name };
+function stockLeft(p, extra = 0) {
+  if (p.stock === null) return Infinity;
+  const inCart = cart.filter(l => l.pid === p.id).reduce((a, l) => a + l.qty, 0);
+  const inDrafts = Object.values(drafts).flat().filter(l => l.pid === p.id).reduce((a, l) => a + l.qty, 0);
+  return p.stock - inCart - inDrafts - extra;
+}
+function addToCart(pid) {
+  const p = products.find(x => x.id === pid); if (!p) return;
+  if (stockLeft(p) < 1) { toast("No hay más unidades de " + p.name); return; }
+  const list = selTab ? draftOf(selTab) : cart;
+  const l = list.find(x => x.pid === pid);
+  if (l) l.qty++; else list.push({ pid, name: p.name, price: p.price, qty: 1 });
+  renderTicket();
+}
+function changeList(list, pid, delta) {
+  if (delta > 0) return addToCart(pid);
+  const i = list.findIndex(l => l.pid === pid); if (i < 0) return;
+  list[i].qty--; if (list[i].qty <= 0) list.splice(i, 1); renderTicket();
+}
+
+// Guarda el pedido en curso en la cuenta, todo con la misma hora.
+function commitOrder(tid) {
+  const d = draftOf(tid); if (!d.length) return;
+  const orderId = doc(collection(db, "x")).id, at = nowIso();
   const b = writeBatch(db);
-  b.set(doc(collection(db, "sessions", current, "tabs", tid, "lines")), line);
-  if (p && p.stock !== null) b.update(doc(db, "products", pid), { stock: increment(-delta) });
-  b.commit().catch(e => fail(e, "No se pudo anotar en la cuenta. Revisa la conexión."));
+  for (const l of d) {
+    b.set(doc(collection(db, "sessions", current, "tabs", tid, "lines")), { pid: l.pid, name: l.name, price: l.price, qty: l.qty, orderId, at, by: me.id, byName: me.name });
+    const p = products.find(x => x.id === l.pid);
+    if (p && p.stock !== null) b.update(doc(db, "products", l.pid), { stock: increment(-l.qty) });
+  }
+  const total = sumLines(d);
+  drafts[tid] = [];
+  b.commit().catch(e => fail(e, "No se pudo guardar el pedido. Revisa la conexión."));
+  toast("Pedido agregado · " + fmt(total)); renderTicket();
+}
+// Quita una unidad de un pedido ya guardado (queda registrado como retiro).
+function removeFromOrder(tid, orderId, pid) {
+  const t = tabs.find(x => x.id === tid); if (!t) return;
+  const g = ordersOf(t).find(o => o.id === orderId); if (!g) return;
+  const left = g.lines.filter(l => l.pid === pid).reduce((a, l) => a + l.qty, 0);
+  const src = g.lines.find(l => l.pid === pid && l.qty > 0);
+  if (!src || left < 1) return;
+  const b = writeBatch(db);
+  b.set(doc(collection(db, "sessions", current, "tabs", tid, "lines")), { pid, name: src.name, price: src.price, qty: -1, orderId, at: nowIso(), by: me.id, byName: me.name, removal: true });
+  const p = products.find(x => x.id === pid);
+  if (p && p.stock !== null) b.update(doc(db, "products", pid), { stock: increment(1) });
+  b.commit().catch(e => fail(e));
+}
+
+function orderRows(o) {
+  const agg = aggregate(o.lines), rem = o.lines.filter(l => l.qty < 0);
+  return { agg, rem, total: sumLines(agg) };
 }
 
 function renderTicket() {
   const el = $("#ticket"); if (!el) return;
   const t = curTab(); if (selTab && !t) selTab = null;
-  const lines = t ? aggregate(tabLinesOf(t)) : cart;
-  const total = lines.reduce((a, l) => a + l.price * l.qty, 0);
-  el.innerHTML = `
-  <div class="accbar" role="tablist" aria-label="Cuentas">
-    <button class="acc ${!selTab ? "on" : ""}" data-acc="">Venta rápida<small>${cart.length ? fmt(cart.reduce((a, l) => a + l.price * l.qty, 0)) : "Paga ya"}</small></button>
-    ${tabs.map(x => `<button class="acc ${selTab === x.id ? "on" : ""}" data-acc="${x.id}">${esc(x.label)}<small>${fmt(tabTotal(x))}</small></button>`).join("")}
+  const accbar = `<div class="accbar" role="tablist" aria-label="Cuentas">
+    <button class="acc ${!selTab ? "on" : ""}" data-acc="">Venta rápida<small>${cart.length ? fmt(sumLines(cart)) : "Paga ya"}</small></button>
+    ${tabs.map(x => `<button class="acc ${selTab === x.id ? "on" : ""}" data-acc="${x.id}">${esc(x.label)}${(drafts[x.id] || []).length ? " •" : ""}<small>${fmt(tabTotal(x))}</small></button>`).join("")}
     <button class="acc add" id="newTab">+ Cuenta</button>
-  </div>
-  <div class="ticket-h"><div style="min-width:0"><h3>${t ? esc(t.label) : "Venta rápida"}</h3><div class="meta">${t ? `Abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}${t.note ? " · " + esc(t.note) : ""}` : "Se cobra en el momento"}</div></div>
-    ${t ? `<button class="btn btn-sm" id="detBtn">Desglose</button>` : (cart.length ? `<button class="btn btn-ghost btn-sm" id="clr">Vaciar</button>` : "")}</div>
-  <div class="lines">${lines.length ? lines.map(l => `<div class="line"><div class="ln">${esc(l.name)}<div class="lu num">${fmt(l.price)} c/u</div></div>
-    <div class="qty"><button data-dec="${l.pid}" aria-label="Quitar uno">−</button><span class="num">${l.qty}</span><button data-inc="${l.pid}" aria-label="Agregar uno">+</button></div>
-    <div class="lt num">${fmt(l.price * l.qty)}</div></div>`).join("")
-    : `<div class="empty">${t ? "Toca los productos para anotarlos en esta cuenta." : "Toca un producto para agregarlo."}</div>`}</div>
-  <div class="ticket-f">
-    <div class="total"><span class="label">${t ? "Consumo" : "Total"}</span><span class="v num gold-text">${fmt(total)}</span></div>
-    ${t ? `<div class="note">Lo que se toque queda anotado en ${esc(t.label)} con la hora. Se cobra cuando el cliente se va.</div>` : ""}
-    <button class="btn btn-gold btn-lg" id="pay" ${lines.length ? "" : "disabled"}>${t ? "Cobrar cuenta" : "Cobrar"} ${lines.length ? fmt(total) : ""}</button>
   </div>`;
+  const lineRow = l => `<div class="line"><div class="ln">${esc(l.name)}<div class="lu num">${fmt(l.price)} c/u</div></div>
+    <div class="qty"><button data-dec="${l.pid}" aria-label="Quitar uno">−</button><span class="num">${l.qty}</span><button data-inc="${l.pid}" aria-label="Agregar uno">+</button></div>
+    <div class="lt num">${fmt(l.price * l.qty)}</div></div>`;
+  if (!t) {
+    const total = sumLines(cart);
+    el.innerHTML = accbar + `
+    <div class="ticket-h"><div style="min-width:0"><h3>Venta rápida</h3><div class="meta">Se cobra en el momento</div></div>${cart.length ? `<button class="btn btn-ghost btn-sm" id="clr">Vaciar</button>` : ""}</div>
+    <div class="lines">${cart.length ? cart.map(lineRow).join("") : `<div class="empty">Toca un producto para agregarlo.</div>`}</div>
+    <div class="ticket-f">
+      <div class="total"><span class="label">Total</span><span class="v num gold-text">${fmt(total)}</span></div>
+      <button class="btn btn-gold btn-lg" id="pay" ${cart.length ? "" : "disabled"}>Cobrar ${cart.length ? fmt(total) : ""}</button>
+    </div>`;
+  } else {
+    const d = draftOf(t.id), dTotal = sumLines(d), orders = ordersOf(t), total = tabTotal(t);
+    el.innerHTML = accbar + `
+    <div class="ticket-h"><div style="min-width:0"><h3>${esc(t.label)}</h3><div class="meta">Abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}${t.note ? " · " + esc(t.note) : ""}</div></div>
+      <button class="btn btn-sm" id="detBtn">Desglose</button></div>
+    <div class="neworder">
+      <div class="no-h"><span class="label">Pedido nuevo</span>${d.length ? `<button class="btn btn-ghost btn-sm" id="clrD">Descartar</button>` : ""}</div>
+      <div class="lines">${d.length ? d.map(lineRow).join("") : `<div class="empty">Toca los productos que pide ${esc(t.label)} y luego pulsa <b>Agregar pedido</b>.</div>`}</div>
+      <button class="btn btn-gold" id="addOrder" ${d.length ? "" : "disabled"}>Agregar pedido${d.length ? " · " + fmt(dTotal) : ""}</button>
+    </div>
+    <div class="orders">
+      <div class="label">Pedidos de la cuenta (${orders.filter(o => !o.onlyRemovals).length})</div>
+      ${orders.length ? orders.filter(o => !o.onlyRemovals).map((o, i) => { const r = orderRows(o); return `<div class="ord">
+        <div class="ord-h"><span><b>Pedido ${i + 1}</b> · <span class="num">${tm(o.at)}</span></span><span class="num">${fmt(r.total)}</span></div>
+        <div class="ord-i">${r.agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ") || "Retirado todo"}${r.rem.length ? ` <span class="muted">(${r.rem.length} retirado${r.rem.length > 1 ? "s" : ""})</span>` : ""}</div>
+      </div>`; }).join("") : `<div class="muted small">Todavía no hay pedidos guardados.</div>`}
+    </div>
+    <div class="ticket-f">
+      <div class="total"><span class="label">Total de la cuenta</span><span class="v num gold-text">${fmt(total)}</span></div>
+      ${d.length ? `<div class="note warn">Hay un pedido nuevo sin agregar.</div>` : ""}
+      <button class="btn btn-lg" id="pay" ${total && !d.length ? "" : "disabled"}>Cobrar cuenta ${total ? fmt(total) : ""}</button>
+    </div>`;
+    el.querySelector("#detBtn").onclick = () => detailModal(t.id);
+    el.querySelector("#addOrder").onclick = () => commitOrder(t.id);
+    el.querySelector("#clrD")?.addEventListener("click", () => { drafts[t.id] = []; renderTicket(); });
+  }
   el.querySelectorAll("[data-acc]").forEach(b => b.onclick = () => { selTab = b.dataset.acc || null; renderTicket(); });
   el.querySelector("#newTab").onclick = newTabModal;
   el.querySelector("#clr")?.addEventListener("click", () => { cart = []; renderTicket(); });
-  el.querySelector("#detBtn")?.addEventListener("click", () => detailModal(t.id));
-  el.querySelectorAll("[data-inc]").forEach(b => b.onclick = () => t ? changeTab(t.id, b.dataset.inc, 1) : changeCart(b.dataset.inc, 1));
-  el.querySelectorAll("[data-dec]").forEach(b => b.onclick = () => t ? changeTab(t.id, b.dataset.dec, -1) : changeCart(b.dataset.dec, -1));
+  const list = t ? draftOf(t.id) : cart;
+  el.querySelectorAll("[data-inc]").forEach(b => b.onclick = () => changeList(list, b.dataset.inc, 1));
+  el.querySelectorAll("[data-dec]").forEach(b => b.onclick = () => changeList(list, b.dataset.dec, -1));
   el.querySelector("#pay").onclick = () => payModal(t);
 }
 
@@ -411,20 +480,23 @@ function renderDetail(m) {
   const t = tabs.find(x => x.id === tid) || (pendingTab && pendingTab.id === tid ? pendingTab : null);
   const body = m.querySelector("[data-body]");
   if (!t) { body.innerHTML = `<h3>Cuenta cobrada</h3><p class="muted">Esta cuenta ya fue cobrada.</p><div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`; body.querySelector("[data-x]").onclick = m._close; return; }
-  const lines = tabLinesOf(t), agg = aggregate(lines), total = agg.reduce((a, l) => a + l.price * l.qty, 0);
+  const orders = ordersOf(t).filter(o => !o.onlyRemovals), agg = aggregate(tabLinesOf(t)), total = sumLines(agg);
   body.innerHTML = `<div class="sec" style="gap:14px">
     <div><div class="label">Desglose · abierta ${tm(t.openedAt)} por ${esc(t.openedByName)}</div><h3 style="margin-top:4px;font-size:1.3rem">${esc(t.label)}</h3>${t.note ? `<div class="muted small">${esc(t.note)}</div>` : ""}</div>
-    <div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Producto</th><th class="r">Cant.</th><th class="r">Valor</th><th>Anotó</th></tr></thead><tbody>
-    ${lines.length ? lines.map(l => `<tr${l.qty < 0 ? ' class="minus"' : ""}><td class="num">${tm(l.at)}</td><td>${esc(l.name)}${l.qty < 0 ? ' <span class="pill bad">Retirado</span>' : ""}</td><td class="r num">${l.qty > 0 ? "+" : "−"}${Math.abs(l.qty)}</td><td class="r num">${l.qty < 0 ? "−" : ""}${fmt(Math.abs(l.qty) * l.price)}</td><td class="muted">${esc(l.byName || "")}</td></tr>`).join("")
-      : `<tr><td colspan="5" class="empty">Todavía no hay productos anotados.</td></tr>`}
-    </tbody></table></div>
-    ${agg.length ? `<div><div class="label" style="margin-bottom:4px">Resumen</div><div class="sum num">${agg.map(l => `<div><span>${l.qty}× ${esc(l.name)}</span><span>${fmt(l.qty * l.price)}</span></div>`).join("")}</div></div>` : ""}
+    ${orders.length ? orders.map((o, i) => { const r = orderRows(o); return `<div class="ord big">
+      <div class="ord-h"><span><b>Pedido ${i + 1}</b> · <span class="num">${tm(o.at)}</span> <span class="muted small">· ${esc(o.byName || "")}</span></span><span class="num"><b>${fmt(r.total)}</b></span></div>
+      <table><tbody>
+        ${r.agg.map(l => `<tr><td class="r num" style="width:3em">${l.qty}×</td><td>${esc(l.name)}</td><td class="r num">${fmt(l.qty * l.price)}</td><td class="r" style="width:5.5em">${o.id !== "legacy" ? `<button class="btn btn-ghost btn-sm" data-rm="${o.id}|${l.pid}" aria-label="Quitar uno de ${esc(l.name)}">Quitar 1</button>` : ""}</td></tr>`).join("")}
+        ${r.rem.map(l => `<tr class="minus"><td class="r num">−${-l.qty}</td><td>${esc(l.name)} <span class="pill bad">Retirado ${tm(l.at)}</span></td><td class="r num">−${fmt(-l.qty * l.price)}</td><td></td></tr>`).join("")}
+      </tbody></table>
+    </div>`; }).join("") : `<div class="panel pad empty">Todavía no hay pedidos guardados.</div>`}
     <div class="total"><span class="label">Total de la cuenta</span><span class="v num gold-text">${fmt(total)}</span></div>
-    <div class="modal-f"><button class="btn btn-ghost" data-x>Cerrar</button><button class="btn" data-add>Agregar productos</button><button class="btn btn-gold" data-pay ${agg.length ? "" : "disabled"}>Cobrar ${fmt(total)}</button></div>
+    <div class="modal-f"><button class="btn btn-ghost" data-x>Cerrar</button><button class="btn" data-add>Nuevo pedido</button><button class="btn btn-gold" data-pay ${total && !draftOf(tid).length ? "" : "disabled"}>Cobrar ${fmt(total)}</button></div>
   </div>`;
   body.querySelector("[data-x]").onclick = m._close;
   body.querySelector("[data-add]").onclick = () => { m._close(); selTab = tid; tab = "caja"; render(); };
   body.querySelector("[data-pay]").onclick = () => { m._close(); payModal(t); };
+  body.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => { const [oid, pid] = b.dataset.rm.split("|"); removeFromOrder(tid, oid, pid); });
 }
 
 /* ---------- imágenes (capture de transferencia y foto de producto) ---------- */
@@ -455,6 +527,7 @@ function bindPicker(root, id, onFile) {
 }
 
 function payModal(t) {
+  if (t && draftOf(t.id).length) { toast("Primero agrega o descarta el pedido nuevo de " + t.label); return; }
   const lines = t ? aggregate(tabLinesOf(t)) : cart.map(l => ({ ...l }));
   const total = lines.reduce((a, l) => a + l.price * l.qty, 0);
   let m = "efectivo", img = null;
@@ -517,7 +590,7 @@ function payModal(t) {
               if (!s.exists() || s.data().status !== "open") throw { code: "tab-closed" };
               if (rcptRef) tx.set(rcptRef, { img, at: nowIso(), by: me.id, session: sid, total: tot });
               tx.set(saleRef, { ...base, items, total: tot, account: fresh.label, tabId: t.id, tabOpenedAt: fresh.openedAt,
-                lines: allLines.map(l => ({ name: l.name, qty: l.qty, price: l.price, at: l.at, byName: l.byName || "" })) });
+                lines: allLines.map(l => ({ name: l.name, qty: l.qty, price: l.price, at: l.at, byName: l.byName || "", orderId: l.orderId || null })) });
               tx.update(tref, { status: "paid", paidAt: nowIso(), paidBy: me.name, saleId: saleRef.id, total: tot });
             });
             selTab = null;
@@ -554,10 +627,13 @@ async function receiptModal(id) {
 // Desglose de una venta ya cobrada (desde Movimientos).
 function saleDetailModal(x) {
   const lines = x.lines || [];
+  const fake = { id: "_s", items: [], openedAt: x.at };
+  tabLines._s = lines.map((l, i) => ({ id: "l" + i, ...l }));
+  const orders = lines.length ? ordersOf(fake).filter(o => !o.onlyRemovals) : [];
+  delete tabLines._s;
   modal(`<div class="label">${esc(METHODS[x.method] || x.method)} · cobrada ${tm(x.at)} por ${esc(x.byName)}</div><h3 style="font-size:1.3rem">${esc(x.account || "Venta rápida")}</h3>
-  ${lines.length ? `<div class="tbl-wrap"><table><thead><tr><th>Hora</th><th>Producto</th><th class="r">Cant.</th><th>Anotó</th></tr></thead><tbody>
-    ${lines.map(l => `<tr><td class="num">${tm(l.at)}</td><td>${esc(l.name)}${l.qty < 0 ? ' <span class="pill bad">Retirado</span>' : ""}</td><td class="r num">${l.qty > 0 ? "+" : "−"}${Math.abs(l.qty)}</td><td class="muted">${esc(l.byName || "")}</td></tr>`).join("")}
-  </tbody></table></div>` : ""}
+  ${orders.map((o, i) => { const r = orderRows(o); return `<div class="ord big"><div class="ord-h"><span><b>Pedido ${i + 1}</b> · <span class="num">${tm(o.at)}</span> <span class="muted small">· ${esc(o.byName || "")}</span></span><span class="num"><b>${fmt(r.total)}</b></span></div>
+    <div class="ord-i">${r.agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ")}${r.rem.length ? ` <span class="muted">(${r.rem.length} retirado${r.rem.length > 1 ? "s" : ""})</span>` : ""}</div></div>`; }).join("")}
   <div class="sum num">${x.items.map(i => `<div><span>${i.qty}× ${esc(i.name)}</span><span>${fmt(i.qty * i.price)}</span></div>`).join("")}</div>
   <div class="total"><span class="label">Total</span><span class="v num gold-text">${fmt(x.total)}</span></div>
   <div class="modal-f"><button class="btn btn-gold" data-x>Cerrar</button></div>`, (m, c) => { m.querySelector("[data-x]").onclick = c; });
@@ -569,16 +645,16 @@ function viewCuentas(v) {
   const sum = tabs.reduce((a, x) => a + tabTotal(x), 0);
   v.innerHTML = `<div class="sec"><div class="sec-h"><div><div class="label">${tabs.length} cuentas abiertas · ${fmt(sum)} por cobrar</div><h2>Cuentas por mesa y cliente</h2></div><button class="btn btn-gold" id="newTab2">Nueva cuenta</button></div>
   ${tabs.length ? `<div class="cards">${tabs.map(x => {
-    const agg = aggregate(tabLinesOf(x)), last = (tabLines[x.id] || []).slice(-1)[0];
+    const agg = aggregate(tabLinesOf(x)), ords = ordersOf(x).filter(o => !o.onlyRemovals), last = ords.slice(-1)[0];
     return `<div class="panel card">
     <button class="card-hit" data-det="${x.id}" aria-label="Ver desglose de ${esc(x.label)}">
       <div class="ct"><h3>${esc(x.label)}</h3><span class="muted small">${tm(x.openedAt)}</span></div>
       ${x.note ? `<div class="muted small">${esc(x.note)}</div>` : ""}
       <div class="items">${agg.length ? agg.map(l => `${l.qty}× ${esc(l.name)}`).join(", ") : "Sin consumo todavía"}</div>
       <div class="amt num">${fmt(agg.reduce((a, l) => a + l.price * l.qty, 0))}</div>
-      <div class="muted small">${last ? "Último pedido " + tm(last.at) + " · " : ""}Toca para ver el desglose</div>
+      <div class="muted small">${ords.length} pedido${ords.length === 1 ? "" : "s"}${last ? " · último " + tm(last.at) : ""} · Toca para ver el desglose</div>
     </button>
-    <div class="row"><button class="btn btn-sm" data-open="${x.id}">Agregar productos</button><button class="btn btn-gold btn-sm" data-pay="${x.id}" ${agg.length ? "" : "disabled"}>Cobrar</button></div>
+    <div class="row"><button class="btn btn-sm" data-open="${x.id}">Nuevo pedido</button><button class="btn btn-gold btn-sm" data-pay="${x.id}" ${agg.length ? "" : "disabled"}>Cobrar</button></div>
   </div>`; }).join("")}</div>` : `<div class="panel pad empty">No hay cuentas abiertas. Crea una cuando llegue una mesa o un cliente que paga al final.</div>`}</div>`;
   $("#newTab2").onclick = newTabModal;
   v.querySelectorAll("[data-det]").forEach(b => b.onclick = () => detailModal(b.dataset.det));
