@@ -1,11 +1,17 @@
-// Pega aquí la configuración de tu proyecto de Firebase.
-// Firebase Console → ⚙ Configuración del proyecto → General → Tus apps → App web → "Configuración del SDK".
+// Configuración del proyecto de Firebase de Santorini Club.
 // Estos valores NO son secretos: la seguridad la dan las reglas de firestore.rules.
 export const firebaseConfig = {
-  apiKey: "PEGA_AQUI_TU_API_KEY",
-  authDomain: "tu-proyecto.firebaseapp.com",
-  projectId: "tu-proyecto",
-  storageBucket: "tu-proyecto.appspot.com",
-  messagingSenderId: "000000000000",
-  appId: "1:000000000000:web:0000000000000000"
+
+  apiKey: "AIzaSyAXZVOAErQfIAc07y6wA6bwFaUwv3hlHsU",
+
+  authDomain: "santorini-club-caja.firebaseapp.com",
+
+  projectId: "santorini-club-caja",
+
+  storageBucket: "santorini-club-caja.firebasestorage.app",
+
+  messagingSenderId: "1005369065100",
+
+  appId: "1:1005369065100:web:5e60acb8ae40cffffc05a9"
+
 };
